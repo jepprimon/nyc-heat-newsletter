@@ -366,41 +366,118 @@ def _is_title_case(name: str) -> bool:
 
 def _is_resy_restaurant_booking_url(url: str) -> bool:
     """
-    Keep ONLY URLs that are plausibly restaurant booking pages.
-    Reject Resy OS / help / legal / marketing.
+    Accept Resy/OpenTable URLs that plausibly point to a restaurant booking/venue page.
+    Resy venue URLs commonly appear as:
+      - https://resy.com/cities/ny/<restaurant-slug>
+      - https://resy.com/cities/ny/venues/<slug>
+      - https://resy.com/cities/ny/places/<slug>
+      - https://resy.com/r/<slug>
+    Reject OS/legal/help/marketing/etc.
     """
     if not url:
         return False
     u = url.lower()
 
-    if "resy.com" not in u and "opentable.com" not in u:
+    # OpenTable is fine
+    if "opentable.com" in u:
+        return True
+
+    if "resy.com" not in u:
         return False
 
-    # hard rejects
+    # hard rejects (marketing / product / legal / help)
     reject_fragments = [
-        "/os", "resy-os", "help", "privacy", "terms", "cookie", "accessibility",
+        "resy-os", "/os", "help", "privacy", "terms", "cookie", "accessibility",
         "/about", "/careers", "/press", "/for-restaurants", "/request-a-demo",
         "pricing", "features", "dashboard", "overview",
+        "/gift", "/gifts", "/credit",
     ]
     if any(frag in u for frag in reject_fragments):
         return False
 
-    # if it's Resy, prefer actual venue-like patterns
-    if "resy.com" in u:
-        # Typical venue patterns include /cities/..., /venues/..., /restaurants/..., /r/...
-        allow_fragments = ["/cities/", "/venues/", "/restaurants/", "/r/"]
-        if not any(a in u for a in allow_fragments):
-            return False
+    try:
+        path = urlparse(url).path.lower()
+    except Exception:
+        return False
 
-    return True
+    # easy allow patterns
+    if "/r/" in path:
+        return True
+    if "/venues/" in path or "/places/" in path or "/restaurants/" in path:
+        return True
+
+    # allow /cities/<city>/<slug> where slug is not a generic category page
+    if path.startswith("/cities/"):
+        parts = [p for p in path.split("/") if p]  # e.g. ['cities','ny','wild-cherry']
+        if len(parts) >= 3:
+            slug = parts[2]
+            # reject non-restaurant city subpages
+            bad_slugs = {
+                "search", "nearby", "neighborhoods", "guides", "collections",
+                "events", "top-rated", "top", "new", "new-on-resy", "restaurants",
+                "dining", "about",
+            }
+            if slug in bad_slugs:
+                return False
+            # also reject if it's clearly a category path like /cities/ny/neighborhoods/...
+            if len(parts) >= 4 and parts[2] in bad_slugs:
+                return False
+            return True
+
+    return False
+
+
+def _resy_name_from_context(a: Tag) -> Optional[str]:
+    """
+    Resy blog often has booking links with anchor text like 'Reserve' or 'Get Resy alerts'.
+    This tries to infer the restaurant name from nearby context:
+      - nearest previous strong/b within same paragraph/section
+      - nearest previous h2/h3
+      - aria-label/title attributes
+    """
+    # 1) aria-label / title sometimes contains name
+    for attr in ("aria-label", "title"):
+        v = a.get(attr)
+        if v:
+            cand = _strip_leading_numbering(v.strip())
+            if _looks_like_restaurant_name(cand):
+                return cand
+
+    # 2) look within the same paragraph/container for strong/b text
+    container = a.find_parent(["p", "li", "div", "section", "article"])
+    if container:
+        strong = container.find(["strong", "b"])
+        if strong:
+            cand = _strip_leading_numbering(strong.get_text(" ", strip=True))
+            if _looks_like_restaurant_name(cand):
+                return cand
+
+    # 3) walk backwards through previous elements for a nearby name-like heading/strong
+    steps = 0
+    for el in a.previous_elements:
+        if not isinstance(el, Tag):
+            continue
+        steps += 1
+        if steps > 120:  # keep it local
+            break
+        if el.name in ("h2", "h3"):
+            cand = _strip_leading_numbering(el.get_text(" ", strip=True))
+            if _looks_like_restaurant_name(cand):
+                return cand
+        if el.name in ("strong", "b"):
+            cand = _strip_leading_numbering(el.get_text(" ", strip=True))
+            if _looks_like_restaurant_name(cand):
+                return cand
+
+    return None
 
 
 def _fallback_from_outbound_links_resy(scope: Tag, base_url: str) -> List[Restaurant]:
     """
-    Tight Resy fallback:
-      - only inside the article scope (not footer/nav)
-      - only restaurant-booking-like URLs
-      - anchor text must look like a restaurant name AND be Title Case
+    Tight-but-correct Resy fallback:
+      - only inside article scope (no footer/nav)
+      - only accept links that look like restaurant/venue booking URLs
+      - if anchor text isn't a restaurant name, infer it from context
     """
     out: List[Restaurant] = []
     seen: set[str] = set()
@@ -412,18 +489,25 @@ def _fallback_from_outbound_links_resy(scope: Tag, base_url: str) -> List[Restau
         if not _is_resy_restaurant_booking_url(href):
             continue
 
-        text = _strip_leading_numbering(a.get_text(" ", strip=True))
-        if not _looks_like_restaurant_name(text):
-            continue
-        if not _is_title_case(text):
+        raw_text = _strip_leading_numbering(a.get_text(" ", strip=True))
+        name = raw_text if _looks_like_restaurant_name(raw_text) else _resy_name_from_context(a)
+        if not name:
             continue
 
-        key = _norm_name(text)
+        name = _strip_leading_numbering(name)
+        if not _looks_like_restaurant_name(name):
+            continue
+
+        # Extra guard: avoid single generic words like "About", "Events"
+        if name.lower() in _REJECT_EXACT:
+            continue
+
+        key = _norm_name(name)
         if key in seen:
             continue
         seen.add(key)
 
-        out.append(Restaurant(name=text, url=href, sources=["Resy"]))
+        out.append(Restaurant(name=name, url=href, sources=["Resy"]))
 
     return out
 
@@ -499,9 +583,8 @@ def extract_resy_hit_list(html: str) -> List[Restaurant]:
     restaurants = dedupe([r for r in restaurants if _looks_like_restaurant_name(r.name)])
 
     # Tight fallback: ONLY within article, ONLY venue-like booking URLs
-    if len(restaurants) < 8:
-        fb = _fallback_from_outbound_links_resy(article, base_url=base_url)
-        restaurants = dedupe(restaurants + fb)
+fb = _fallback_from_outbound_links_resy(article, base_url=base_url)
+restaurants = dedupe(restaurants + fb)
 
     # Final cleanup: remove any remaining exact rejects
     cleaned = []
