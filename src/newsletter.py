@@ -548,13 +548,13 @@ def extract_resy_hit_list(html: str) -> List[Restaurant]:
     base_domain = "resy.com"
 
     soup = BeautifulSoup(html, "lxml")
-    article = soup.find("article") or soup  # IMPORTANT: keep scope tight
+    article = soup.find("article") or soup  # keep scope tight
 
     restaurants: List[Restaurant] = []
 
     headings = article.find_all(["h2", "h3"])
 
-    # Heading-based extraction (Resy sometimes works)
+    # Heading-based extraction (best case)
     for i, h in enumerate(headings):
         raw = h.get_text(" ", strip=True)
         name = _strip_leading_numbering(raw)
@@ -563,10 +563,16 @@ def extract_resy_hit_list(html: str) -> List[Restaurant]:
 
         nodes = _entry_slice_nodes_from_list(headings, i)
         why = _first_paragraph_from_slice(nodes)
-        image_url = _pick_image_from_slice(nodes, base_url=base_url, restaurant_name=name, max_tags_to_scan=80, stop_on_modules=False)
-        url = _pick_link_from_slice(nodes, base_url=base_url, base_domain=base_domain)
 
-        # If url exists but is clearly not a venue booking url, drop it (prevents OS/legal bleed)
+        image_url = _pick_image_from_slice(
+            nodes,
+            base_url=base_url,
+            restaurant_name=name,
+            max_tags_to_scan=80,
+            stop_on_modules=False,
+        )
+
+        url = _pick_link_from_slice(nodes, base_url=base_url, base_domain=base_domain)
         if url and not _is_resy_restaurant_booking_url(url):
             url = None
 
@@ -580,17 +586,17 @@ def extract_resy_hit_list(html: str) -> List[Restaurant]:
             )
         )
 
-    restaurants = dedupe([r for r in restaurants if _looks_like_restaurant_name(r.name)])
+    # Always add fallback (it fills in missing entries where the booking link is "Reserve")
+    fb = _fallback_from_outbound_links_resy(article, base_url=base_url)
+    restaurants = dedupe(restaurants + fb)
 
-    # Tight fallback: ONLY within article, ONLY venue-like booking URLs
-fb = _fallback_from_outbound_links_resy(article, base_url=base_url)
-restaurants = dedupe(restaurants + fb)
-
-    # Final cleanup: remove any remaining exact rejects
-    cleaned = []
+    # Final cleanup
+    cleaned: List[Restaurant] = []
     for r in restaurants:
         r.name = _strip_leading_numbering(r.name)
         if not _looks_like_restaurant_name(r.name):
+            continue
+        if r.name.lower() in _REJECT_EXACT:
             continue
         cleaned.append(r)
 
