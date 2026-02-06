@@ -249,7 +249,7 @@ def render_newsletter(output_dir: str, restaurants: List[Restaurant]) -> Tuple[s
         sources=[{"name": s.name, "url": s.url} for s in SOURCES],
     )
 
-    issue_slug = now_local.strftime("%Y-%m")
+    issue_slug = now_local.strftime("%Y-%m-%d")
     os.makedirs(output_dir, exist_ok=True)
     out_path = os.path.join(output_dir, f"issue-{issue_slug}.html")
     index_path = os.path.join(output_dir, "index.html")
