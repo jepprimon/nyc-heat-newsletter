@@ -1,0 +1,60 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width" />
+    <title>{{ title }}</title>
+    <style>
+      body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, Arial, sans-serif; margin: 0; padding: 0; background: #ffffff; color: #111; }
+      .container { max-width: 720px; margin: 0 auto; padding: 28px 18px 40px; }
+      h1 { font-size: 22px; margin: 0 0 6px; font-weight: 700; letter-spacing: 0.2px; }
+      .sub { font-size: 13px; color: #555; margin: 0 0 18px; }
+      .meta { font-size: 12px; color: #666; margin: 0 0 18px; }
+      .hr { height: 1px; background: #eee; margin: 18px 0; }
+      .item { padding: 14px 0; }
+      .rankline { display: flex; gap: 10px; align-items: baseline; justify-content: space-between; }
+      .name { font-size: 16px; font-weight: 650; margin: 0; }
+      .score { font-size: 12px; color: #222; border: 1px solid #ddd; border-radius: 999px; padding: 2px 10px; }
+      .tags { font-size: 12px; color: #666; margin: 6px 0 8px; }
+      .why { font-size: 13px; margin: 0 0 8px; line-height: 1.35; color: #222; }
+      .tip { font-size: 12px; margin: 0; color: #333; }
+      a { color: inherit; }
+      .small { font-size: 11px; color: #777; }
+      .sources { margin-top: 18px; font-size: 11px; color: #666; }
+      ul { margin: 8px 0 0 18px; padding: 0; }
+      li { margin: 3px 0; }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <h1>{{ title }}</h1>
+      <p class="sub">Resy Hit List + Eater Heatmap, compiled automatically.</p>
+      <p class="meta">Period: {{ period_label }} · Generated: {{ generated_at }}</p>
+
+      <div class="hr"></div>
+
+      {% for r in restaurants %}
+      <div class="item">
+        <div class="rankline">
+          <p class="name">{{ loop.index }}. {% if r.url %}<a href="{{ r.url }}">{{ r.name }}</a>{% else %}{{ r.name }}{% endif %}</p>
+          <span class="score">Heat {{ r.heat_score }}</span>
+        </div>
+        <div class="tags">{{ r.neighborhood or "NYC" }}{% if r.cuisine %} · {{ r.cuisine }}{% endif %}{% if r.sources %} · {{ ", ".join(r.sources) }}{% endif %}</div>
+        {% if r.why_hot %}<p class="why">{{ r.why_hot }}</p>{% endif %}
+        <p class="tip"><strong>Reservations:</strong> {{ r.res_difficulty }} — {{ r.booking_tip }}</p>
+        {% if r.notes %}<p class="small">{{ r.notes }}</p>{% endif %}
+      </div>
+      <div class="hr"></div>
+      {% endfor %}
+
+      <div class="sources">
+        <div><strong>Sources</strong></div>
+        <ul>
+          {% for s in sources %}
+          <li><a href="{{ s.url }}">{{ s.name }}</a></li>
+          {% endfor %}
+        </ul>
+      </div>
+    </div>
+  </body>
+</html>
