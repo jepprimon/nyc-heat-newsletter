@@ -39,8 +39,16 @@ class Restaurant:
 # Utility helpers
 # ---------------------------
 
+def _strip_leading_numbering(name: str) -> str:
+    if not name:
+        return name
+    # handles: "18. Foo", "18) Foo", "18 - Foo", "18 — Foo", "18: Foo"
+    return re.sub(r"^\s*\d+\s*[\.\)\-–—:]\s*", "", name).strip()
+
+
 def _norm_name(name: str) -> str:
-    n = name.lower().strip()
+    n = _strip_leading_numbering(name or "")
+    n = n.lower().strip()
     n = re.sub(r"[\u2019’]", "'", n)
     n = re.sub(r"\s+", " ", n)
     n = re.sub(r"[^a-z0-9 '&-]", "", n)
@@ -55,7 +63,7 @@ def _abs_url(base: str, href: Optional[str]) -> Optional[str]:
 
 def fetch_html(url: str, timeout: int = 45, retries: int = 4) -> str:
     headers = {
-        "User-Agent": "nyc-heat-index-bot/1.9 (+https://github.com/)",
+        "User-Agent": "nyc-heat-index-bot/2.0 (+https://github.com/)",
         "Accept-Language": "en-US,en;q=0.9",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Connection": "close",
@@ -283,7 +291,7 @@ def _ok_for_og(url: str) -> bool:
 
 
 # ---------------------------
-# Name heuristics + fallbacks (tightened for Resy)
+# Name heuristics + Resy-specific URL gating
 # ---------------------------
 
 _BAD_NAME_FRAGMENTS = [
@@ -304,32 +312,30 @@ _BAD_NAME_FRAGMENTS = [
     "the heatmap",
 ]
 
+# hard nav/footer junk that should never become a card
+_REJECT_EXACT = {
+    "about", "careers", "nearby restaurants", "climbing", "top rated", "new on resy",
+    "events", "features", "plans & pricing", "why resy os", "request a demo",
+    "resy help desk", "global privacy policy", "terms of service", "cookie policy",
+    "accessibility statement", "resy os overview", "resy os dashboard",
+    "for restaurants", "resy", "get resy emails", "the resy credit", "global dining access",
+}
+
 
 def _looks_like_restaurant_name(name: str) -> bool:
     if not name:
         return False
-    n = name.strip()
+    n = _strip_leading_numbering(name.strip())
     if len(n) < 2 or len(n) > 80:
         return False
 
     low = n.lower()
-
-    # obvious UI / product items
-    if low in {
-        "resy",
-        "for restaurants",
-        "get resy emails",
-        "the resy credit",
-        "global dining access",
-        "here",
-    }:
+    if low in _REJECT_EXACT:
         return False
 
-    # reject dates like "Feb. 10"
     if re.match(r"^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+\d{1,2}$", low):
         return False
 
-    # reject "sentence-y" fragments commonly mis-captured
     if low.startswith(("a ", "an ", "the ", "watch ", "viewing ", "buffet ", "four-course")):
         return False
 
@@ -343,12 +349,11 @@ def _looks_like_restaurant_name(name: str) -> bool:
 
 
 def _is_title_case(name: str) -> bool:
-    words = [w for w in name.split() if w]
+    words = [w for w in _strip_leading_numbering(name).split() if w]
     if not words:
         return False
     if len(words) == 1:
         return words[0][:1].isupper()
-    # allow one lowercase connector like "of", "and", "the"
     lowers = {"of", "and", "the", "la", "le", "el", "de", "da", "di", "del"}
     ok = 0
     for w in words:
@@ -359,28 +364,55 @@ def _is_title_case(name: str) -> bool:
     return ok >= len(words) - 1
 
 
-def _fallback_from_outbound_links_resy(html: str, base_url: str) -> List[Restaurant]:
+def _is_resy_restaurant_booking_url(url: str) -> bool:
+    """
+    Keep ONLY URLs that are plausibly restaurant booking pages.
+    Reject Resy OS / help / legal / marketing.
+    """
+    if not url:
+        return False
+    u = url.lower()
+
+    if "resy.com" not in u and "opentable.com" not in u:
+        return False
+
+    # hard rejects
+    reject_fragments = [
+        "/os", "resy-os", "help", "privacy", "terms", "cookie", "accessibility",
+        "/about", "/careers", "/press", "/for-restaurants", "/request-a-demo",
+        "pricing", "features", "dashboard", "overview",
+    ]
+    if any(frag in u for frag in reject_fragments):
+        return False
+
+    # if it's Resy, prefer actual venue-like patterns
+    if "resy.com" in u:
+        # Typical venue patterns include /cities/..., /venues/..., /restaurants/..., /r/...
+        allow_fragments = ["/cities/", "/venues/", "/restaurants/", "/r/"]
+        if not any(a in u for a in allow_fragments):
+            return False
+
+    return True
+
+
+def _fallback_from_outbound_links_resy(scope: Tag, base_url: str) -> List[Restaurant]:
     """
     Tight Resy fallback:
-    - Only accept links to resy.com/opentable.com
-    - Anchor text must look like a restaurant name AND be Title Case
+      - only inside the article scope (not footer/nav)
+      - only restaurant-booking-like URLs
+      - anchor text must look like a restaurant name AND be Title Case
     """
-    soup = BeautifulSoup(html, "lxml")
     out: List[Restaurant] = []
     seen: set[str] = set()
 
-    for a in soup.find_all("a", href=True):
+    for a in scope.find_all("a", href=True):
         href = _abs_url(base_url, a.get("href"))
         if not href or not href.startswith("http"):
             continue
-        hlow = href.lower()
-
-        if not (("resy.com" in hlow) or ("opentable.com" in hlow)):
-            continue
-        if "blog.resy.com" in hlow:
+        if not _is_resy_restaurant_booking_url(href):
             continue
 
-        text = a.get_text(" ", strip=True)
+        text = _strip_leading_numbering(a.get_text(" ", strip=True))
         if not _looks_like_restaurant_name(text):
             continue
         if not _is_title_case(text):
@@ -391,16 +423,13 @@ def _fallback_from_outbound_links_resy(html: str, base_url: str) -> List[Restaur
             continue
         seen.add(key)
 
-        out.append(Restaurant(name=text.strip(), url=href, sources=["Resy"]))
+        out.append(Restaurant(name=text, url=href, sources=["Resy"]))
 
     return out
 
 
-def _fallback_from_outbound_links(html: str, base_url: str, source_label: str) -> List[Restaurant]:
-    """
-    Generic fallback used for non-Resy sources (kept for completeness).
-    """
-    soup = BeautifulSoup(html, "lxml")
+def _fallback_from_outbound_links_generic(scope: Tag, base_url: str, source_label: str) -> List[Restaurant]:
+    soup = scope
     out: List[Restaurant] = []
     seen: set[str] = set()
 
@@ -409,13 +438,10 @@ def _fallback_from_outbound_links(html: str, base_url: str, source_label: str) -
         if not href or not href.startswith("http"):
             continue
         hlow = href.lower()
-
         if not (("resy.com" in hlow) or ("opentable.com" in hlow)):
             continue
-        if "blog.resy.com" in hlow:
-            continue
 
-        text = a.get_text(" ", strip=True)
+        text = _strip_leading_numbering(a.get_text(" ", strip=True))
         if not _looks_like_restaurant_name(text):
             continue
 
@@ -424,7 +450,7 @@ def _fallback_from_outbound_links(html: str, base_url: str, source_label: str) -
             continue
         seen.add(key)
 
-        out.append(Restaurant(name=text.strip(), url=href, sources=[source_label]))
+        out.append(Restaurant(name=text, url=href, sources=[source_label]))
 
     return out
 
@@ -438,15 +464,16 @@ def extract_resy_hit_list(html: str) -> List[Restaurant]:
     base_domain = "resy.com"
 
     soup = BeautifulSoup(html, "lxml")
-    article = soup.find("article") or soup
+    article = soup.find("article") or soup  # IMPORTANT: keep scope tight
 
     restaurants: List[Restaurant] = []
+
     headings = article.find_all(["h2", "h3"])
 
-    # Heading-based extraction
+    # Heading-based extraction (Resy sometimes works)
     for i, h in enumerate(headings):
-        text = h.get_text(" ", strip=True)
-        name = re.sub(r"^\s*\d+\.\s*", "", text).strip()
+        raw = h.get_text(" ", strip=True)
+        name = _strip_leading_numbering(raw)
         if not _looks_like_restaurant_name(name):
             continue
 
@@ -454,6 +481,10 @@ def extract_resy_hit_list(html: str) -> List[Restaurant]:
         why = _first_paragraph_from_slice(nodes)
         image_url = _pick_image_from_slice(nodes, base_url=base_url, restaurant_name=name, max_tags_to_scan=80, stop_on_modules=False)
         url = _pick_link_from_slice(nodes, base_url=base_url, base_domain=base_domain)
+
+        # If url exists but is clearly not a venue booking url, drop it (prevents OS/legal bleed)
+        if url and not _is_resy_restaurant_booking_url(url):
+            url = None
 
         restaurants.append(
             Restaurant(
@@ -467,18 +498,16 @@ def extract_resy_hit_list(html: str) -> List[Restaurant]:
 
     restaurants = dedupe([r for r in restaurants if _looks_like_restaurant_name(r.name)])
 
-    # Tight fallback: only if we got too few
-    if len(restaurants) < 5:
-        fb = _fallback_from_outbound_links_resy(html, base_url=base_url)
+    # Tight fallback: ONLY within article, ONLY venue-like booking URLs
+    if len(restaurants) < 8:
+        fb = _fallback_from_outbound_links_resy(article, base_url=base_url)
         restaurants = dedupe(restaurants + fb)
 
-    # Final cleanup
-    cleaned: List[Restaurant] = []
+    # Final cleanup: remove any remaining exact rejects
+    cleaned = []
     for r in restaurants:
+        r.name = _strip_leading_numbering(r.name)
         if not _looks_like_restaurant_name(r.name):
-            continue
-        # If the fallback generated a name, enforce Title Case to avoid fragments
-        if (r.why_hot is None or len((r.why_hot or "").split()) < 12) and not _is_title_case(r.name):
             continue
         cleaned.append(r)
 
@@ -496,7 +525,7 @@ def extract_eater_heatmap(html: str) -> List[Restaurant]:
     headings = article.find_all(["h2", "h3"])
 
     for i, h in enumerate(headings):
-        title = h.get_text(" ", strip=True)
+        title = _strip_leading_numbering(h.get_text(" ", strip=True))
         if not _looks_like_restaurant_name(title):
             continue
 
@@ -506,7 +535,7 @@ def extract_eater_heatmap(html: str) -> List[Restaurant]:
         if low in ("see more", "more maps in eater ny") or low.startswith("more maps"):
             continue
 
-        name = title.strip()
+        name = title
         nodes = _entry_slice_nodes_from_list(headings, i)
 
         why = _first_paragraph_from_slice(nodes)
@@ -528,8 +557,9 @@ def extract_eater_heatmap(html: str) -> List[Restaurant]:
         )
 
     restaurants = dedupe(restaurants)
+
     if len(restaurants) < 5:
-        fb = _fallback_from_outbound_links(html, base_url=base_url, source_label="Eater")
+        fb = _fallback_from_outbound_links_generic(article, base_url=base_url, source_label="Eater")
         restaurants = dedupe(restaurants + fb)
 
     return restaurants
@@ -542,6 +572,7 @@ def extract_eater_heatmap(html: str) -> List[Restaurant]:
 def dedupe(items: List[Restaurant]) -> List[Restaurant]:
     seen: Dict[str, Restaurant] = {}
     for r in items:
+        r.name = _strip_leading_numbering(r.name)
         key = _norm_name(r.name)
         if key not in seen:
             seen[key] = r
@@ -741,7 +772,6 @@ def main() -> None:
     for r in merged:
         r.sources = sorted(list(set(r.sources or [])))
 
-    # Fill missing images from OG where appropriate
     for r in merged:
         if not r.image_url and r.url and _ok_for_og(r.url):
             r.image_url = og_image(r.url)
