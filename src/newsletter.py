@@ -20,13 +20,14 @@ from jinja2 import Environment, FileSystemLoader, select_autoescape
 from config import SOURCES, WEIGHTS, INTENSITY_KEYWORDS, SCARCITY_KEYWORDS
 
 DEFAULT_RESY_IMAGE = (os.environ.get("DEFAULT_RESY_IMAGE") or "").strip() or None
+PUBLIC_BASE_URL = (os.environ.get("PUBLIC_BASE_URL") or "").strip().rstrip("/") or None
 
 
 @dataclass
 class Restaurant:
     name: str
     url: Optional[str] = None          # primary “reserve / info” link
-    image_url: Optional[str] = None    # thumbnail
+    image_url: Optional[str] = None    # thumbnail (final)
     neighborhood: Optional[str] = None
     cuisine: Optional[str] = None
     why_hot: Optional[str] = None
@@ -69,7 +70,7 @@ def _abs_url(base: str, href: Optional[str]) -> Optional[str]:
 
 def fetch_html(url: str, timeout: int = 45, retries: int = 4) -> str:
     headers = {
-        "User-Agent": "nyc-heat-index-bot/3.2 (+https://github.com/)",
+        "User-Agent": "nyc-heat-index-bot/3.3 (+https://github.com/)",
         "Accept-Language": "en-US,en;q=0.9",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Connection": "close",
@@ -456,9 +457,8 @@ def _is_resy_restaurant_booking_url(url: str) -> bool:
 
 
 def _is_legit_resy_hitlist_photo(u: str) -> bool:
-    # IMPORTANT: only accept photos that appear on the Hit List page itself
-    # and come from Resy's image CDN.
-    u_low = (u or "").lower()
+    # Only accept photos that appear on the Hit List page and come from Resy's image CDN.
+    u_low = (u or "").lower().strip()
     return u_low.startswith("https://image.resy.com/")
 
 
@@ -468,7 +468,7 @@ _RESY_IMAGE_STOP_PHRASES = ("discover more", "craving something else", "craving 
 def _pick_resy_image_for_heading(h: Tag, base_url: str, restaurant_name: str) -> Optional[str]:
     """
     Hit List ONLY: scan forward from the heading and accept only image.resy.com photos.
-    If none found in the entry itself, return None (so default wordmark applies).
+    Do not look up venue pages; if no photo in the entry itself, return None.
     """
     name_norm = _norm_name(restaurant_name)
     best_score = -10_000
@@ -479,7 +479,6 @@ def _pick_resy_image_for_heading(h: Tag, base_url: str, restaurant_name: str) ->
         alt_norm = _norm_name(alt or "")
         s = 0
 
-        # hard reject known junk
         hard_reject = [
             "s3.amazonaws.com/resy.com/images/social/",
             "facebook-preview",
@@ -494,11 +493,9 @@ def _pick_resy_image_for_heading(h: Tag, base_url: str, restaurant_name: str) ->
         if any(x in u_low for x in hard_reject):
             return -10_000
 
-        # we only allow resy photo CDN anyway, but keep this for safety
         if not _is_legit_resy_hitlist_photo(u_low):
             return -10_000
 
-        # strong preference: alt matches restaurant name
         if name_norm and name_norm in alt_norm:
             s += 80
         else:
@@ -545,8 +542,78 @@ def _pick_resy_image_for_heading(h: Tag, base_url: str, restaurant_name: str) ->
             if sc > best_score:
                 best_score, best_url = sc, u2
 
-    # Only accept confident matches; otherwise force default
     return best_url if best_score >= 60 else None
+
+
+# ---------------------------
+# Cache/Re-host Resy images for GitHub Pages reliability
+# ---------------------------
+
+def _slugify(s: str) -> str:
+    s = _norm_name(s)
+    s = re.sub(r"\s+", "-", s).strip("-")
+    return s[:80] or "img"
+
+
+def _cache_remote_image(url: str, out_path: str) -> bool:
+    """
+    Download an image to the dist/assets directory so it renders on GitHub Pages.
+    Uses a Referer header to reduce chance of hotlink blocks.
+    """
+    try:
+        headers = {
+            "User-Agent": "nyc-heat-index-bot/3.3 (+https://github.com/)",
+            "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+            "Referer": "https://blog.resy.com/",
+        }
+        r = requests.get(url, headers=headers, timeout=(15, 45))
+        if r.status_code != 200 or not r.content:
+            return False
+
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        with open(out_path, "wb") as f:
+            f.write(r.content)
+        return True
+    except Exception:
+        return False
+
+
+def cache_resy_images_for_pages(restaurants: List[Restaurant], dist_dir: str) -> None:
+    """
+    Re-host Resy Hit List images under dist/assets so GitHub Pages can load them.
+    Only caches images already found on the Hit List page (image.resy.com).
+    If caching fails, fall back to DEFAULT_RESY_IMAGE.
+    """
+    assets_dir = os.path.join(dist_dir, "assets")
+    cached = 0
+    attempted = 0
+
+    for r in restaurants:
+        is_resy_only = r.sources and ("Resy" in r.sources) and ("Eater" not in r.sources)
+        if not is_resy_only or not r.image_url:
+            continue
+
+        if not r.image_url.lower().startswith("https://image.resy.com/"):
+            continue
+
+        attempted += 1
+        fname = f"resy-{_slugify(r.name)}.jpg"
+        out_path = os.path.join(assets_dir, fname)
+
+        ok = _cache_remote_image(r.image_url, out_path)
+        if ok:
+            cached += 1
+            if PUBLIC_BASE_URL:
+                r.image_url = f"{PUBLIC_BASE_URL}/assets/{fname}"
+            else:
+                r.image_url = f"assets/{fname}"
+        else:
+            if DEFAULT_RESY_IMAGE:
+                r.image_url = DEFAULT_RESY_IMAGE
+            else:
+                r.image_url = None
+
+    print(f"[ResyCache] attempted={attempted} cached={cached} public_base_set={bool(PUBLIC_BASE_URL)}")
 
 
 # ---------------------------
@@ -649,7 +716,6 @@ def extract_resy_hit_list(html: str) -> List[Restaurant]:
 
         nodes = _entry_slice_nodes_from_list(headings, i)
         why = _first_real_paragraph_from_slice(nodes)
-
         image_url = _pick_resy_image_for_heading(h, base_url=base_url, restaurant_name=name)
 
         url = _pick_link_from_slice(nodes, base_url=base_url, base_domain=base_domain)
@@ -663,8 +729,6 @@ def extract_resy_hit_list(html: str) -> List[Restaurant]:
             why_hot=why,
             sources=["Resy"],
         ))
-
-    restaurants = dedupe(restaurants)
 
     cleaned: List[Restaurant] = []
     for r in restaurants:
@@ -744,7 +808,7 @@ def extract_eater_heatmap(html: str) -> List[Restaurant]:
             sources=["Eater"],
         ))
 
-    return dedupe(restaurants)
+    return restaurants
 
 
 # ---------------------------
@@ -975,7 +1039,7 @@ def main() -> None:
 
         is_resy_only = r.sources and ("Resy" in r.sources) and ("Eater" not in r.sources)
         if is_resy_only:
-            continue  # IMPORTANT: do not pull images from elsewhere for Resy cards
+            continue
 
         if (not r.image_url) and r.url and _ok_for_og(r.url):
             img = og_image(r.url)
@@ -992,10 +1056,12 @@ def main() -> None:
 
     compute_heat(merged, last_month_names)
 
-    title, out_path = render_newsletter(
-        output_dir=os.path.join(os.path.dirname(__file__), "..", "dist"),
-        restaurants=merged,
-    )
+    dist_dir = os.path.join(os.path.dirname(__file__), "..", "dist")
+
+    # Cache/re-host Resy images so GitHub Pages doesn't show broken hotlinked images
+    cache_resy_images_for_pages(merged, dist_dir=dist_dir)
+
+    title, out_path = render_newsletter(output_dir=dist_dir, restaurants=merged)
     with open(out_path, "r", encoding="utf-8") as f:
         html_body = f.read()
 
@@ -1007,6 +1073,7 @@ def main() -> None:
     print("Total cards:", len(merged))
     print("Images:", sum(1 for r in merged if r.image_url), "of", len(merged))
     print("[Config] DEFAULT_RESY_IMAGE set:", bool(DEFAULT_RESY_IMAGE))
+    print("[Config] PUBLIC_BASE_URL set:", bool(PUBLIC_BASE_URL))
 
 if __name__ == "__main__":
     main()
