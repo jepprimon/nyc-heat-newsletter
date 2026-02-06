@@ -1,0 +1,67 @@
+name: Monthly NYC Heat Index
+
+on:
+  schedule:
+    # 14:00 UTC on the 1st each month (≈ 9am New York during standard time)
+    - cron: "0 14 1 * *"
+  workflow_dispatch: {}
+
+jobs:
+  build-and-send:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Generate & send newsletter
+        env:
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          FROM_EMAIL: ${{ secrets.FROM_EMAIL }}
+          FROM_NAME: ${{ secrets.FROM_NAME }}
+          SUBSCRIBERS: ${{ secrets.SUBSCRIBERS }}
+          TIMEZONE: ${{ secrets.TIMEZONE }}
+          REPLY_TO: ${{ secrets.REPLY_TO }}
+          DRY_RUN: ${{ secrets.DRY_RUN }}
+        run: |
+          python src/newsletter.py
+
+      - name: Publish issue to GitHub Pages (gh-pages)
+        run: |
+          set -e
+          ISSUE_FILE=$(ls -1 dist/issue-*.html | tail -n 1)
+          mkdir -p public
+          cp "$ISSUE_FILE" public/index.html
+          cp dist/issue-*.html public/ || true
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          if git show-ref --quiet refs/heads/gh-pages; then
+            git checkout gh-pages
+          else
+            git checkout --orphan gh-pages
+            git rm -rf . || true
+          fi
+
+          rm -rf *
+          cp -r public/* .
+          rm -rf public
+
+          git add -A
+          git commit -m "Publish monthly issue" || echo "Nothing to commit"
+          git push -f origin gh-pages
