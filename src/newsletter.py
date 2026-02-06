@@ -55,7 +55,7 @@ def _abs_url(base: str, href: Optional[str]) -> Optional[str]:
 
 def fetch_html(url: str, timeout: int = 45, retries: int = 4) -> str:
     headers = {
-        "User-Agent": "nyc-heat-index-bot/1.1 (+https://github.com/)",
+        "User-Agent": "nyc-heat-index-bot/1.2 (+https://github.com/)",
         "Accept-Language": "en-US,en;q=0.9",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Connection": "close",
@@ -75,7 +75,6 @@ def fetch_html(url: str, timeout: int = 45, retries: int = 4) -> str:
             print(f"Fetch failed ({attempt}/{retries}) for {url}: {e}. Retrying in {sleep_s:.1f}s")
             time.sleep(sleep_s)
 
-    # If we got here, we failed all retries
     if last_err:
         raise last_err
     raise RuntimeError(f"Failed to fetch {url} for unknown reasons.")
@@ -100,6 +99,18 @@ def _img_src_from_tag(img) -> Optional[str]:
             return candidates[-1]
 
     return None
+
+
+def _src_from_source_tag(source) -> Optional[str]:
+    srcset = source.get("srcset") or source.get("data-srcset")
+    if not srcset:
+        return None
+    candidates: List[str] = []
+    for part in srcset.split(","):
+        url = part.strip().split(" ")[0].strip()
+        if url:
+            candidates.append(url)
+    return candidates[-1] if candidates else None
 
 
 def _is_useful_outbound(href: str, base_domain: str) -> bool:
@@ -136,33 +147,60 @@ def _pick_primary_link(block: Tag, base_url: str, base_domain: str) -> Optional[
 
 def _pick_image_near_heading(h: Tag, base_url: str) -> Optional[str]:
     """
-    Eater/Resy often place images near the entry but not nested directly under the heading's parent.
-    Strategy:
-      1) Search within a reasonable container ancestor for the first <img>.
-      2) If not found, scan siblings AFTER the heading until the next h2/h3.
+    Try multiple HTML patterns:
+      1) picture/source srcset
+      2) img (src, data-src, srcset, etc.)
+      3) sibling scan until next heading (same checks)
     """
-    # 1) container-first (usually the most reliable)
-    container = h.find_parent(["section", "article"]) or h.find_parent("div") or h.parent
-    if container and isinstance(container, Tag):
+
+    def scan_container(container: Tag) -> Optional[str]:
+        pic = container.find("picture")
+        if pic:
+            src = pic.find("source")
+            if src:
+                u = _src_from_source_tag(src)
+                if u:
+                    return _abs_url(base_url, u)
+
         img = container.find("img")
         if img:
-            src = _img_src_from_tag(img)
-            if src:
-                return _abs_url(base_url, src)
+            u = _img_src_from_tag(img)
+            if u:
+                return _abs_url(base_url, u)
 
-    # 2) sibling scan (good for “image between heading and paragraph” layouts)
+        return None
+
+    container = h.find_parent(["section", "article"]) or h.find_parent("div") or h.parent
+    if container and isinstance(container, Tag):
+        u = scan_container(container)
+        if u:
+            return u
+
     for sib in h.next_siblings:
         if isinstance(sib, Tag) and sib.name in ("h2", "h3"):
             break
         if not isinstance(sib, Tag):
             continue
+        u = scan_container(sib)
+        if u:
+            return u
 
-        img = sib.find("img")
-        if img:
-            src = _img_src_from_tag(img)
-            if src:
-                return _abs_url(base_url, src)
+    return None
 
+
+def og_image(url: str) -> Optional[str]:
+    """
+    Fallback image strategy: fetch the restaurant/booking page and use og:image.
+    This is slow-ish, so we only use it when image_url is missing.
+    """
+    try:
+        html = fetch_html(url, timeout=30, retries=2)
+        soup = BeautifulSoup(html, "lxml")
+        tag = soup.find("meta", property="og:image") or soup.find("meta", attrs={"name": "og:image"})
+        if tag and tag.get("content"):
+            return tag["content"].strip()
+    except Exception:
+        return None
     return None
 
 
@@ -474,6 +512,11 @@ def main() -> None:
     for r in merged:
         r.sources = sorted(list(set(r.sources or [])))
 
+    # Fallback: fill missing images via OpenGraph
+    for r in merged:
+        if not r.image_url and r.url:
+            r.image_url = og_image(r.url)
+
     compute_heat(merged, last_month_names)
 
     title, out_path = render_newsletter(
@@ -488,6 +531,7 @@ def main() -> None:
 
     print("Generated:", out_path)
     print("Title:", title)
+    print("Images:", sum(1 for r in merged if r.image_url), "of", len(merged))
 
 
 if __name__ == "__main__":
