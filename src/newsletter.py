@@ -102,6 +102,7 @@ def _resy_clean_heading_text(h: Tag) -> str:
     """
     Resy sometimes includes inline UI like “Hudson Square map” in the same heading.
     Remove obvious “map” UI nodes, then read the heading text.
+    Robust against rare bs4 elements with attrs=None.
     """
     try:
         h2 = BeautifulSoup(str(h), "lxml").find(h.name)
@@ -110,24 +111,33 @@ def _resy_clean_heading_text(h: Tag) -> str:
 
     if not h2:
         text = h.get_text(" ", strip=True)
-        return re.sub(r"\s+map\s*$", "", text, flags=re.I).strip()
+        text = re.sub(r"\s+map\s*$", "", text, flags=re.I).strip()
+        return text
 
     for t in h2.find_all(["span", "a", "small"]):
-        txt = t.get_text(" ", strip=True).lower()
-        aria = (t.get("aria-label") or "").lower()
-        cls = " ".join(t.get("class", [])).lower()
+        # Be defensive: bs4 can produce elements with attrs=None
+        if not isinstance(t, Tag):
+            continue
+
+        attrs = t.attrs or {}  # ✅ avoid None
+        txt = t.get_text(" ", strip=True)
+        txt_low = (txt or "").lower()
+        aria_low = (attrs.get("aria-label") or "").lower()
+        cls_low = " ".join(attrs.get("class", [])).lower() if attrs.get("class") else ""
+
         # Remove nodes that are plainly map UI
-        if txt == "map" or txt.endswith(" map") or txt == "view map" or "map" in aria:
+        if txt_low in ("map", "view map") or txt_low.endswith(" map") or "map" in aria_low:
             t.decompose()
             continue
-        if "map" in cls and len(txt) <= 20:
+
+        # Remove class-driven map badges
+        if "map" in cls_low and len(txt_low) <= 20:
             t.decompose()
             continue
 
     text = h2.get_text(" ", strip=True)
-    # Final safety: drop trailing “map”
     text = re.sub(r"\s+map\s*$", "", text, flags=re.I).strip()
-    # Also remove patterns like "Hudson Square map" if it remains as last token pair
+    # If some variant leaves "Hudson Square map" at the end, strip trailing "... map"
     text = re.sub(r"\s+[A-Za-z][A-Za-z '&.-]{1,40}\s+map\s*$", "", text, flags=re.I).strip()
     return text
 
