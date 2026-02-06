@@ -55,7 +55,7 @@ def _abs_url(base: str, href: Optional[str]) -> Optional[str]:
 
 def fetch_html(url: str, timeout: int = 45, retries: int = 4) -> str:
     headers = {
-        "User-Agent": "nyc-heat-index-bot/1.7 (+https://github.com/)",
+        "User-Agent": "nyc-heat-index-bot/1.8 (+https://github.com/)",
         "Accept-Language": "en-US,en;q=0.9",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Connection": "close",
@@ -95,6 +95,7 @@ def _img_src_from_tag(img) -> Optional[str]:
                 candidates.append(url)
         if candidates:
             return candidates[-1]
+
     return None
 
 
@@ -115,7 +116,6 @@ def _is_useful_outbound(href: str, base_domain: str) -> bool:
         u = urlparse(href)
         if not u.scheme.startswith("http"):
             return False
-        # exclude same-domain navigation
         if u.netloc.endswith(base_domain):
             return False
         return True
@@ -175,7 +175,43 @@ def _pick_link_from_slice(nodes: List[Tag], base_url: str, base_domain: str) -> 
     return hrefs[0] if hrefs else None
 
 
-def _pick_image_from_slice(nodes: List[Tag], base_url: str, restaurant_name: str) -> Optional[str]:
+# ---------------------------
+# Image picking: proximity + module-boundary guards (fixes "See more" bleed)
+# ---------------------------
+
+_EATER_STOP_WORDS = {
+    "see more",
+    "related",
+    "more maps",
+    "more maps in eater ny",
+    "you might also like",
+}
+
+
+def _hit_stop_boundary(node: Tag) -> bool:
+    if node.name in ("aside", "footer", "nav"):
+        return True
+    txt = node.get_text(" ", strip=True).lower() if isinstance(node, Tag) else ""
+    if txt:
+        for w in _EATER_STOP_WORDS:
+            if w in txt:
+                return True
+    return False
+
+
+def _pick_image_from_slice(
+    nodes: List[Tag],
+    base_url: str,
+    restaurant_name: str,
+    *,
+    max_tags_to_scan: int = 60,
+    stop_on_modules: bool = True,
+) -> Optional[str]:
+    """
+    Pick an image for a restaurant from its entry slice with two protections:
+      - Only scan the first `max_tags_to_scan` Tag nodes (proximity constraint)
+      - Stop early if we hit "See more / Related" module boundaries
+    """
     name_norm = _norm_name(restaurant_name)
     candidates: List[Tuple[int, str]] = []
 
@@ -191,7 +227,18 @@ def _pick_image_from_slice(nodes: List[Tag], base_url: str, restaurant_name: str
             score -= 30
         return score
 
+    scanned = 0
     for node in nodes:
+        if not isinstance(node, Tag):
+            continue
+
+        scanned += 1
+        if scanned > max_tags_to_scan:
+            break
+
+        if stop_on_modules and _hit_stop_boundary(node):
+            break
+
         pic = node.find("picture")
         if pic:
             src = pic.find("source")
@@ -214,6 +261,7 @@ def _pick_image_from_slice(nodes: List[Tag], base_url: str, restaurant_name: str
 
     if not candidates:
         return None
+
     candidates.sort(key=lambda x: x[0], reverse=True)
     return candidates[0][1]
 
@@ -236,7 +284,6 @@ def og_image(url: str) -> Optional[str]:
 
 def _ok_for_og(url: str) -> bool:
     u = (url or "").lower()
-    # Avoid generic OG images from list pages
     if "eater.com" in u:
         return False
     if "blog.resy.com" in u:
@@ -276,17 +323,12 @@ def _looks_like_restaurant_name(name: str) -> bool:
     low = n.lower()
     if any(bad in low for bad in _BAD_NAME_FRAGMENTS):
         return False
-    # avoid pure dates / pure numbers
     if re.fullmatch(r"[0-9\s\-/,:.]+", n):
         return False
     return True
 
 
 def _fallback_from_outbound_links(html: str, base_url: str, source_label: str) -> List[Restaurant]:
-    """
-    Last-resort: pull candidate restaurant names from outbound booking/restaurant links.
-    This is intentionally permissive to avoid an empty issue.
-    """
     soup = BeautifulSoup(html, "lxml")
     out: List[Restaurant] = []
     seen: set[str] = set()
@@ -330,13 +372,11 @@ def extract_resy_hit_list(html: str) -> List[Restaurant]:
     restaurants: List[Restaurant] = []
     headings = article.find_all(["h2", "h3"])
 
-    # Primary: heading-based
     for i, h in enumerate(headings):
         text = h.get_text(" ", strip=True)
         if not _looks_like_restaurant_name(text):
             continue
 
-        # Resy headings sometimes include "1. Name"
         name = re.sub(r"^\s*\d+\.\s*", "", text).strip()
         if not _looks_like_restaurant_name(name):
             continue
@@ -344,10 +384,9 @@ def extract_resy_hit_list(html: str) -> List[Restaurant]:
         nodes = _entry_slice_nodes_from_list(headings, i)
 
         why = _first_paragraph_from_slice(nodes)
-        image_url = _pick_image_from_slice(nodes, base_url=base_url, restaurant_name=name)
+        image_url = _pick_image_from_slice(nodes, base_url=base_url, restaurant_name=name, max_tags_to_scan=80, stop_on_modules=False)
         url = _pick_link_from_slice(nodes, base_url=base_url, base_domain=base_domain)
 
-        # IMPORTANT: do NOT over-gate here; DOM changes should not blank the whole issue.
         restaurants.append(
             Restaurant(
                 name=name,
@@ -359,19 +398,11 @@ def extract_resy_hit_list(html: str) -> List[Restaurant]:
         )
 
     restaurants = dedupe(restaurants)
-
-    # If we got suspiciously few, fallback from outbound booking links
     if len(restaurants) < 5:
         fb = _fallback_from_outbound_links(html, base_url=base_url, source_label="Resy")
         restaurants = dedupe(restaurants + fb)
 
-    # Final cleanup: remove obvious promo header that slipped through
-    cleaned: List[Restaurant] = []
-    for r in restaurants:
-        if _looks_like_restaurant_name(r.name):
-            cleaned.append(r)
-
-    return cleaned
+    return [r for r in restaurants if _looks_like_restaurant_name(r.name)]
 
 
 def extract_eater_heatmap(html: str) -> List[Restaurant]:
@@ -384,14 +415,12 @@ def extract_eater_heatmap(html: str) -> List[Restaurant]:
     restaurants: List[Restaurant] = []
     headings = article.find_all(["h2", "h3"])
 
-    # Primary: heading-based (allow single-word names like "Tera")
     for i, h in enumerate(headings):
         title = h.get_text(" ", strip=True)
         if not _looks_like_restaurant_name(title):
             continue
 
         low = title.lower()
-        # Keep minimal non-entry filters (avoid nuking everything)
         if any(k in low for k in ["related", "updates"]):
             continue
         if low in ("see more", "more maps in eater ny") or low.startswith("more maps"):
@@ -401,7 +430,8 @@ def extract_eater_heatmap(html: str) -> List[Restaurant]:
         nodes = _entry_slice_nodes_from_list(headings, i)
 
         why = _first_paragraph_from_slice(nodes)
-        image_url = _pick_image_from_slice(nodes, base_url=base_url, restaurant_name=name)
+        # Stricter scan + stop boundaries to avoid "See more" image bleed
+        image_url = _pick_image_from_slice(nodes, base_url=base_url, restaurant_name=name, max_tags_to_scan=40, stop_on_modules=True)
         url = _pick_link_from_slice(nodes, base_url=base_url, base_domain=base_domain)
 
         if not url:
@@ -419,8 +449,6 @@ def extract_eater_heatmap(html: str) -> List[Restaurant]:
         )
 
     restaurants = dedupe(restaurants)
-
-    # If suspiciously few, fallback: booking links are rarer on Eater, but try anyway
     if len(restaurants) < 5:
         fb = _fallback_from_outbound_links(html, base_url=base_url, source_label="Eater")
         restaurants = dedupe(restaurants + fb)
@@ -634,19 +662,15 @@ def main() -> None:
     for r in merged:
         r.sources = sorted(list(set(r.sources or [])))
 
-    # If STILL empty, add a diagnostic card so you never get a blank issue
     if not merged:
         merged = [
             Restaurant(
                 name="(Extraction produced 0 restaurants)",
-                url=None,
-                image_url=None,
-                why_hot="This usually means the source pages changed structure or blocked requests. Check the Actions logs for the 'extracted X items' lines.",
+                why_hot="Source page structure likely changed or blocked requests. Check Actions logs for 'extracted X items'.",
                 sources=["System"],
             )
         ]
 
-    # Fill missing images (only when URL isn't a list page)
     for r in merged:
         if not r.image_url and r.url and _ok_for_og(r.url):
             r.image_url = og_image(r.url)
