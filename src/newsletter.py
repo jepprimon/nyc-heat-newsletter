@@ -44,8 +44,12 @@ class Restaurant:
 def _strip_leading_numbering(name: str) -> str:
     if not name:
         return name
-    # "18. Foo", "18) Foo", "18 — Foo"
     return re.sub(r"^\s*\d+\s*[\.\)\-–—:]\s*", "", name).strip()
+
+
+def _leading_num(text: str) -> Optional[int]:
+    m = re.match(r"^\s*(\d{1,3})\s*[\.\)\-–—:]\s*", text or "")
+    return int(m.group(1)) if m else None
 
 
 def _norm_name(name: str) -> str:
@@ -63,14 +67,9 @@ def _abs_url(base: str, href: Optional[str]) -> Optional[str]:
     return urljoin(base, href)
 
 
-def _leading_num(text: str) -> Optional[int]:
-    m = re.match(r"^\s*(\d{1,3})\s*[\.\)\-–—:]\s*", text or "")
-    return int(m.group(1)) if m else None
-
-
 def fetch_html(url: str, timeout: int = 45, retries: int = 4) -> str:
     headers = {
-        "User-Agent": "nyc-heat-index-bot/3.0 (+https://github.com/)",
+        "User-Agent": "nyc-heat-index-bot/3.1 (+https://github.com/)",
         "Accept-Language": "en-US,en;q=0.9",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Connection": "close",
@@ -93,6 +92,44 @@ def fetch_html(url: str, timeout: int = 45, retries: int = 4) -> str:
     if last_err:
         raise last_err
     raise RuntimeError(f"Failed to fetch {url} for unknown reasons.")
+
+
+# ---------------------------
+# Resy heading cleanup (removes “map” UI text)
+# ---------------------------
+
+def _resy_clean_heading_text(h: Tag) -> str:
+    """
+    Resy sometimes includes inline UI like “Hudson Square map” in the same heading.
+    Remove obvious “map” UI nodes, then read the heading text.
+    """
+    try:
+        h2 = BeautifulSoup(str(h), "lxml").find(h.name)
+    except Exception:
+        h2 = None
+
+    if not h2:
+        text = h.get_text(" ", strip=True)
+        return re.sub(r"\s+map\s*$", "", text, flags=re.I).strip()
+
+    for t in h2.find_all(["span", "a", "small"]):
+        txt = t.get_text(" ", strip=True).lower()
+        aria = (t.get("aria-label") or "").lower()
+        cls = " ".join(t.get("class", [])).lower()
+        # Remove nodes that are plainly map UI
+        if txt == "map" or txt.endswith(" map") or txt == "view map" or "map" in aria:
+            t.decompose()
+            continue
+        if "map" in cls and len(txt) <= 20:
+            t.decompose()
+            continue
+
+    text = h2.get_text(" ", strip=True)
+    # Final safety: drop trailing “map”
+    text = re.sub(r"\s+map\s*$", "", text, flags=re.I).strip()
+    # Also remove patterns like "Hudson Square map" if it remains as last token pair
+    text = re.sub(r"\s+[A-Za-z][A-Za-z '&.-]{1,40}\s+map\s*$", "", text, flags=re.I).strip()
+    return text
 
 
 # ---------------------------
@@ -148,12 +185,10 @@ def _pick_link_from_slice(nodes: List[Tag], base_url: str, base_domain: str) -> 
             if u and u.startswith("http"):
                 hrefs.append(u)
 
-    # Prefer booking links
     for u in hrefs:
         if "resy.com" in u or "opentable.com" in u:
             return u
 
-    # Otherwise first outbound
     for u in hrefs:
         if _is_useful_outbound(u, base_domain):
             return u
@@ -196,7 +231,7 @@ def _src_from_source_tag(source) -> Optional[str]:
 
 
 # ---------------------------
-# Eater image picking (stop at modules like "See more")
+# Eater image picking (stop at modules like “See more”)
 # ---------------------------
 
 _EATER_STOP_WORDS = {"see more", "related", "more maps", "more maps in eater ny", "you might also like"}
@@ -269,7 +304,7 @@ def _pick_image_from_slice(
 
 
 # ---------------------------
-# OG image fallback (restricted)
+# OG image fallback (restricted; allows Eater venue pages)
 # ---------------------------
 
 def og_image(url: str) -> Optional[str]:
@@ -286,6 +321,10 @@ def og_image(url: str) -> Optional[str]:
 
 def _ok_for_og(url: str) -> bool:
     u = (url or "").lower()
+    # Allow Eater venue pages only (fills gaps like Babbo/Babbo-like entries)
+    if "ny.eater.com/venue/" in u:
+        return True
+    # Otherwise keep conservative blocks
     if "eater.com" in u:
         return False
     if "blog.resy.com" in u:
@@ -347,10 +386,8 @@ def _is_resy_restaurant_booking_url(url: str) -> bool:
         return False
     u = url.lower()
 
-    # OpenTable: allow
     if "opentable.com" in u:
         return True
-
     if "resy.com" not in u:
         return False
 
@@ -396,8 +433,7 @@ _RESY_IMAGE_STOP_PHRASES = ("discover more", "craving something else", "craving 
 def _pick_resy_image_for_heading(h: Tag, base_url: str, restaurant_name: str) -> Optional[str]:
     """
     Scan forward from a numbered restaurant heading until next numbered heading
-    or stop phrase, and pick the best (non-logo) image. If uncertain, return None
-    so the Resy wordmark fallback can apply.
+    or stop phrase, and pick the best (non-logo) image. If uncertain, return None.
     """
     name_norm = _norm_name(restaurant_name)
     best_score = -10_000
@@ -410,7 +446,7 @@ def _pick_resy_image_for_heading(h: Tag, base_url: str, restaurant_name: str) ->
         if name_norm and name_norm in alt_norm:
             s += 60
         if any(bad in u_low for bad in ["logo", "icon", "avatar", "placeholder", "sprite", "spinner"]):
-            s -= 50
+            s -= 60
         if u_low.endswith(".svg"):
             s -= 40
         return s
@@ -420,10 +456,9 @@ def _pick_resy_image_for_heading(h: Tag, base_url: str, restaurant_name: str) ->
         if not isinstance(el, Tag):
             continue
         steps += 1
-        if steps > 180:
+        if steps > 200:
             break
 
-        # stop at next numbered restaurant heading
         if el.name in ("h2", "h3", "h4"):
             t = el.get_text(" ", strip=True)
             if _leading_num(t) is not None:
@@ -432,7 +467,6 @@ def _pick_resy_image_for_heading(h: Tag, base_url: str, restaurant_name: str) ->
             if any(p in low for p in _RESY_IMAGE_STOP_PHRASES):
                 break
 
-        # pictures
         pic = el.find("picture")
         if pic:
             src = pic.find("source")
@@ -445,7 +479,6 @@ def _pick_resy_image_for_heading(h: Tag, base_url: str, restaurant_name: str) ->
                         if sc > best_score:
                             best_score, best_url = sc, u2
 
-        # imgs
         for img in el.find_all("img"):
             u = _img_src_from_tag(img)
             if not u:
@@ -457,7 +490,6 @@ def _pick_resy_image_for_heading(h: Tag, base_url: str, restaurant_name: str) ->
             if sc > best_score:
                 best_score, best_url = sc, u2
 
-    # accept only if not obviously junk
     return best_url if best_score >= 0 else None
 
 
@@ -480,7 +512,6 @@ def extract_resy_hit_list(html: str) -> List[Restaurant]:
         txt_len = len(tag.get_text(" ", strip=True))
         return (p * 6) + (h * 10) + (b * 3) + (txt_len // 1000)
 
-    # choose best scope by density
     candidates: List[Tag] = []
     candidates.extend(soup.find_all("article"))
     candidates.extend(soup.find_all("main"))
@@ -514,7 +545,7 @@ def extract_resy_hit_list(html: str) -> List[Restaurant]:
         return any(p in txt for p in RESY_STOP_PHRASES)
 
     def is_numbered_restaurant_heading(h: Tag) -> bool:
-        raw = h.get_text(" ", strip=True)
+        raw = _resy_clean_heading_text(h)
         n = _leading_num(raw)
         if n is None:
             return False
@@ -523,24 +554,21 @@ def extract_resy_hit_list(html: str) -> List[Restaurant]:
 
     headings_all = [h for h in scope.find_all(["h2", "h3", "h4"]) if not in_nav(h)]
 
-    # stop heading (e.g. "Craving something else?")
     stop_idx: Optional[int] = None
     for idx, h in enumerate(headings_all):
         if is_stop_heading(h):
             stop_idx = idx
             break
 
-    # last numbered restaurant (e.g. 20.)
     last_num_idx: Optional[int] = None
     last_num_value: Optional[int] = None
     for idx, h in enumerate(headings_all):
         if is_numbered_restaurant_heading(h):
-            n = _leading_num(h.get_text(" ", strip=True))
+            n = _leading_num(_resy_clean_heading_text(h))
             if n is not None and (last_num_value is None or n >= last_num_value):
                 last_num_value = n
                 last_num_idx = idx
 
-    # choose end
     if last_num_idx is not None and stop_idx is not None and last_num_idx < stop_idx:
         end_exclusive = last_num_idx + 1
     elif stop_idx is not None:
@@ -554,9 +582,8 @@ def extract_resy_hit_list(html: str) -> List[Restaurant]:
 
     restaurants: List[Restaurant] = []
 
-    # IMPORTANT FIX: numbered-only cards (kills preamble like "Four Things Not to Miss...")
     for i, h in enumerate(headings):
-        raw = h.get_text(" ", strip=True)
+        raw = _resy_clean_heading_text(h)
         if _leading_num(raw) is None:
             continue  # numbered entries only
 
@@ -675,7 +702,6 @@ def dedupe(items: List[Restaurant]) -> List[Restaurant]:
         e.neighborhood = e.neighborhood or r.neighborhood
         e.cuisine = e.cuisine or r.cuisine
 
-        # Prefer Eater images if present
         eater_img = None
         if (e.sources and "Eater" in (e.sources or []) and e.image_url):
             eater_img = e.image_url
@@ -875,13 +901,18 @@ def main() -> None:
     for r in merged:
         r.sources = sorted(list(set(r.sources or [])))
 
-    # Optional: OG fill for non-Eater/non-Resy-blog links (kept conservative)
+    # OG fill (capped) for allowed pages (includes Eater venue pages)
+    og_filled = 0
     for r in merged:
+        if og_filled >= 10:
+            break
         if not r.image_url and r.url and _ok_for_og(r.url):
-            r.image_url = og_image(r.url)
+            img = og_image(r.url)
+            if img:
+                r.image_url = img
+                og_filled += 1
 
     # Default Resy wordmark ONLY for Resy-only items still missing an image.
-    # (If it's in both, Eater image should already have won in dedupe.)
     if DEFAULT_RESY_IMAGE:
         for r in merged:
             if (not r.image_url) and r.sources and ("Resy" in r.sources) and ("Eater" not in r.sources):
@@ -903,7 +934,7 @@ def main() -> None:
     print("Title:", title)
     print("Total cards:", len(merged))
     print("Images:", sum(1 for r in merged if r.image_url), "of", len(merged))
-
+    print("[Config] DEFAULT_RESY_IMAGE set:", bool(DEFAULT_RESY_IMAGE))
 
 if __name__ == "__main__":
     main()
