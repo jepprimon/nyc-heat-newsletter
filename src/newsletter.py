@@ -3,6 +3,9 @@ import re
 import json
 import smtplib
 import ssl
+import time
+import random
+import requests
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from email.mime.multipart import MIMEMultipart
@@ -39,14 +42,31 @@ def _norm_name(name: str) -> str:
     return n
 
 
-def fetch_html(url: str, timeout: int = 25) -> str:
+def fetch_html(url: str, timeout: int = 45, retries: int = 4) -> str:
     headers = {
         "User-Agent": "nyc-heat-index-bot/1.0 (+https://github.com/)",
         "Accept-Language": "en-US,en;q=0.9",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Connection": "close",
     }
-    r = requests.get(url, headers=headers, timeout=timeout)
-    r.raise_for_status()
-    return r.text
+
+    last_err = None
+    for attempt in range(1, retries + 1):
+        try:
+            # Separate connect and read timeouts: (connect, read)
+            r = requests.get(url, headers=headers, timeout=(15, timeout))
+            r.raise_for_status()
+            return r.text
+        except (requests.exceptions.ReadTimeout,
+                requests.exceptions.ConnectTimeout,
+                requests.exceptions.ConnectionError) as e:
+            last_err = e
+            # Exponential backoff + jitter
+            sleep_s = min(60, (2 ** (attempt - 1)) * 2) + random.random()
+            print(f"Fetch failed ({attempt}/{retries}) for {url}: {e}. Retrying in {sleep_s:.1f}s")
+            time.sleep(sleep_s)
+
+    raise last_err
 
 
 def extract_resy_hit_list(html: str) -> List[Restaurant]:
