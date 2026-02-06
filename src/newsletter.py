@@ -549,16 +549,35 @@ def extract_resy_hit_list(html: str) -> List[Restaurant]:
 
     soup = BeautifulSoup(html, "lxml")
 
-    # 1) Pick the best content scope (Resy blog markup varies / can be A/B tested)
-    scope = (
-        soup.find("article")
-        or soup.find("main")
-        or soup.select_one(".entry-content, .post-content, .article-content, .content, [data-testid='post-content']")
-        or soup.body
-        or soup
-    )
+    def score_scope(tag: Optional[Tag]) -> int:
+        if not tag or not isinstance(tag, Tag):
+            return -1
+        # Weight things that indicate real article content
+        p = len(tag.find_all("p"))
+        h = len(tag.find_all(["h2", "h3", "h4"]))
+        b = len(tag.find_all(["strong", "b"]))
+        # Text length helps distinguish real post body vs nav widgets
+        txt_len = len(tag.get_text(" ", strip=True))
+        return (p * 6) + (h * 10) + (b * 3) + (txt_len // 1000)
 
-    # 2) Detect likely block/consent/bot pages early
+    # Candidate scopes (Resy page markup varies)
+    candidates: List[Tag] = []
+    candidates.extend(soup.find_all("article"))
+    candidates.extend(soup.find_all("main"))
+
+    sel = soup.select(
+        ".entry-content, .post-content, .article-content, .content, "
+        ".single-content, .post__content, [data-testid='post-content']"
+    )
+    candidates.extend([t for t in sel if isinstance(t, Tag)])
+
+    if soup.body:
+        candidates.append(soup.body)
+
+    # Pick the most content-dense scope
+    scope = max(candidates, key=score_scope) if candidates else (soup.body or soup)
+
+    # Basic “blocked/consent” warning (keep, but don’t hard fail)
     page_text = soup.get_text(" ", strip=True).lower()
     if any(k in page_text for k in [
         "access denied", "request blocked", "unusual traffic", "verify you are human",
@@ -566,9 +585,6 @@ def extract_resy_hit_list(html: str) -> List[Restaurant]:
     ]):
         title = (soup.title.get_text(" ", strip=True) if soup.title else "")
         print(f"[Resy] WARNING: page looks blocked/consent-gated. title='{title}' text_len={len(page_text)}")
-        # still attempt extraction (sometimes it’s a false positive)
-
-    restaurants: List[Restaurant] = []
 
     def in_nav(tag: Tag) -> bool:
         for p in tag.parents:
@@ -579,8 +595,10 @@ def extract_resy_hit_list(html: str) -> List[Restaurant]:
                 return True
         return False
 
-    # 3) Heading-based extraction across scope (but avoid nav/footer)
-    headings = [h for h in scope.find_all(["h2", "h3"]) if not in_nav(h)]
+    restaurants: List[Restaurant] = []
+
+    # --- Heading-based extraction (allow h4 too; Resy sometimes uses it)
+    headings = [h for h in scope.find_all(["h2", "h3", "h4"]) if not in_nav(h)]
     for i, h in enumerate(headings):
         raw = h.get_text(" ", strip=True)
         name = _strip_leading_numbering(raw)
@@ -610,8 +628,7 @@ def extract_resy_hit_list(html: str) -> List[Restaurant]:
             sources=["Resy"],
         ))
 
-    # 4) Strong/b fallback (Resy Hit List often formats names as bold in paragraphs)
-    #    This does NOT rely on link text being the name.
+    # --- Strong/b fallback (Resy often has bold restaurant names in paragraphs)
     if len(restaurants) < 8:
         for p in scope.find_all("p"):
             if in_nav(p):
@@ -624,14 +641,12 @@ def extract_resy_hit_list(html: str) -> List[Restaurant]:
             if not _looks_like_restaurant_name(name):
                 continue
 
-            # why_hot: paragraph minus the bold name (best effort)
             full_txt = p.get_text(" ", strip=True)
             why = None
             if full_txt:
                 why = re.sub(re.escape(strong.get_text(" ", strip=True)), "", full_txt, count=1).strip()
                 why = re.sub(r"^[\s:–—-]+", "", why).strip() or None
 
-            # booking link in this paragraph (or nearest following links)
             url = None
             for a in p.find_all("a", href=True):
                 href = _abs_url(base_url, a["href"])
@@ -640,20 +655,21 @@ def extract_resy_hit_list(html: str) -> List[Restaurant]:
                     break
 
             if not url:
-                # look a little bit ahead in the DOM for a booking link
+                # look slightly ahead for a booking link
                 steps = 0
                 for el in p.next_elements:
                     if isinstance(el, Tag):
                         if el.name == "p":
                             break
-                        a2 = el.find("a", href=True)
-                        if a2:
+                        for a2 in el.find_all("a", href=True):
                             href2 = _abs_url(base_url, a2["href"])
                             if href2 and _is_resy_restaurant_booking_url(href2):
                                 url = href2
                                 break
+                        if url:
+                            break
                         steps += 1
-                        if steps > 80:
+                        if steps > 120:
                             break
 
             restaurants.append(Restaurant(
@@ -664,8 +680,8 @@ def extract_resy_hit_list(html: str) -> List[Restaurant]:
                 sources=["Resy"],
             ))
 
-    # 5) Final dedupe + cleanup
     restaurants = dedupe(restaurants)
+
     cleaned: List[Restaurant] = []
     for r in restaurants:
         r.name = _strip_leading_numbering(r.name)
@@ -675,7 +691,10 @@ def extract_resy_hit_list(html: str) -> List[Restaurant]:
             continue
         cleaned.append(r)
 
-    print(f"[Resy] headings={len(headings)} extracted={len(cleaned)} scope_tag={getattr(scope,'name',None)} html_len={len(html)}")
+    print(
+        f"[Resy] scope_tag={getattr(scope,'name',None)} scope_score={score_scope(scope)} "
+        f"headings={len(headings)} p={len(scope.find_all('p'))} extracted={len(cleaned)} html_len={len(html)}"
+    )
     return cleaned
 
 
