@@ -55,7 +55,7 @@ def _abs_url(base: str, href: Optional[str]) -> Optional[str]:
 
 def fetch_html(url: str, timeout: int = 45, retries: int = 4) -> str:
     headers = {
-        "User-Agent": "nyc-heat-index-bot/1.4 (+https://github.com/)",
+        "User-Agent": "nyc-heat-index-bot/1.5 (+https://github.com/)",
         "Accept-Language": "en-US,en;q=0.9",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Connection": "close",
@@ -277,10 +277,27 @@ def extract_resy_hit_list(html: str) -> List[Restaurant]:
         if not text:
             continue
 
+        # Heuristic filters to avoid non-entry headings
         if len(text) > 90:
             continue
         low = text.lower()
         if any(k in low for k in ["hit list", "where to eat", "updated", "read more", "the hit list"]):
+            continue
+
+        # Filter out obvious non-restaurant / promo headings
+        if any(phrase in low for phrase in [
+            "newest restaurant openings",
+            "openings, now on resy",
+            "now on resy",
+            "newsletter",
+            "sign up",
+            "subscribe",
+            "follow us",
+            "gift card",
+            "resy events",
+            "private dining",
+            "more from resy",
+        ]):
             continue
 
         name = re.sub(r"^\s*\d+\.\s*", "", text).strip()
@@ -288,11 +305,17 @@ def extract_resy_hit_list(html: str) -> List[Restaurant]:
             continue
 
         nodes = _entry_slice_nodes(h)
+        if not nodes:
+            continue
 
         why = _first_paragraph_from_slice(nodes)
         image_url = _pick_image_from_slice(nodes, base_url=base_url, restaurant_name=name)
-
         url = _pick_link_from_slice(nodes, base_url=base_url, base_domain=base_domain)
+
+        # Structural gate: if we have none of the entry signals, it's probably a promo header
+        if not any([why, image_url, url]):
+            continue
+
         if not url:
             a = h.find("a", href=True)
             url = _abs_url(base_url, a["href"]) if a else None
@@ -339,11 +362,17 @@ def extract_eater_heatmap(html: str) -> List[Restaurant]:
 
         name = title.strip()
         nodes = _entry_slice_nodes(h)
+        if not nodes:
+            continue
 
         why = _first_paragraph_from_slice(nodes)
         image_url = _pick_image_from_slice(nodes, base_url=base_url, restaurant_name=name)
-
         url = _pick_link_from_slice(nodes, base_url=base_url, base_domain=base_domain)
+
+        # Structural gate (helps avoid spurious headings)
+        if not any([why, image_url, url]):
+            continue
+
         if not url:
             a = h.find("a", href=True)
             url = _abs_url(base_url, a["href"]) if a else None
