@@ -37,6 +37,7 @@ jobs:
           TIMEZONE: ${{ secrets.TIMEZONE }}
           REPLY_TO: ${{ secrets.REPLY_TO }}
           DRY_RUN: ${{ secrets.DRY_RUN }}
+          DEFAULT_RESY_IMAGE: ${{ secrets.DEFAULT_RESY_IMAGE }}
         run: |
           python src/newsletter.py
 
