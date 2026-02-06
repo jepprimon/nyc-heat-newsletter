@@ -55,7 +55,7 @@ def _abs_url(base: str, href: Optional[str]) -> Optional[str]:
 
 def fetch_html(url: str, timeout: int = 45, retries: int = 4) -> str:
     headers = {
-        "User-Agent": "nyc-heat-index-bot/1.5 (+https://github.com/)",
+        "User-Agent": "nyc-heat-index-bot/1.6 (+https://github.com/)",
         "Accept-Language": "en-US,en;q=0.9",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Connection": "close",
@@ -81,13 +81,11 @@ def fetch_html(url: str, timeout: int = 45, retries: int = 4) -> str:
 
 
 def _img_src_from_tag(img) -> Optional[str]:
-    # Common lazy-load patterns
     for attr in ("src", "data-src", "data-lazy-src", "data-original", "data-url"):
         v = img.get(attr)
         if v:
             return v.strip()
 
-    # srcset patterns: prefer the last (usually largest) candidate
     srcset = img.get("srcset") or img.get("data-srcset")
     if srcset:
         candidates: List[str] = []
@@ -126,21 +124,26 @@ def _is_useful_outbound(href: str, base_domain: str) -> bool:
 
 
 # ---------------------------
-# Entry slicing (key for correct image/link pairing)
+# Robust entry slicing (between headings in document order)
 # ---------------------------
 
-def _entry_slice_nodes(h: Tag) -> List[Tag]:
+def _collect_between(start: Tag, end: Optional[Tag]) -> List[Tag]:
     """
-    Return the Tag nodes that belong to this restaurant entry:
-    everything after heading `h` until the next h2/h3.
+    Collect Tag nodes in document order after `start` up to (but not including) `end`.
+    Works even when the next heading isn't a sibling.
     """
     nodes: List[Tag] = []
-    for sib in h.next_siblings:
-        if isinstance(sib, Tag) and sib.name in ("h2", "h3"):
+    for el in start.next_elements:
+        if el is end:
             break
-        if isinstance(sib, Tag):
-            nodes.append(sib)
+        if isinstance(el, Tag):
+            nodes.append(el)
     return nodes
+
+
+def _entry_slice_nodes_from_list(headings: List[Tag], idx: int) -> List[Tag]:
+    end = headings[idx + 1] if idx + 1 < len(headings) else None
+    return _collect_between(headings[idx], end)
 
 
 def _first_paragraph_from_slice(nodes: List[Tag]) -> Optional[str]:
@@ -165,12 +168,10 @@ def _pick_link_from_slice(nodes: List[Tag], base_url: str, base_domain: str) -> 
             if u and u.startswith("http"):
                 hrefs.append(u)
 
-    # Prefer booking links
     for u in hrefs:
         if "resy.com" in u or "opentable.com" in u:
             return u
 
-    # Prefer outbound (restaurant site)
     for u in hrefs:
         if _is_useful_outbound(u, base_domain):
             return u
@@ -180,14 +181,9 @@ def _pick_link_from_slice(nodes: List[Tag], base_url: str, base_domain: str) -> 
 
 def _pick_image_from_slice(nodes: List[Tag], base_url: str, restaurant_name: str) -> Optional[str]:
     """
-    Choose the best image inside the entry slice only.
-    Heuristics:
-      - Prefer images whose alt text contains the restaurant name
-      - Avoid logos/icons/avatars/placeholders
-      - Prefer larger srcset candidate if available
+    Choose best image inside the entry slice only (prevents mismatched images).
     """
     name_norm = _norm_name(restaurant_name)
-
     candidates: List[Tuple[int, str]] = []
 
     def score_url(u: str, alt: str) -> int:
@@ -203,7 +199,6 @@ def _pick_image_from_slice(nodes: List[Tag], base_url: str, restaurant_name: str
         return score
 
     for node in nodes:
-        # picture/source first
         pic = node.find("picture")
         if pic:
             src = pic.find("source")
@@ -214,7 +209,6 @@ def _pick_image_from_slice(nodes: List[Tag], base_url: str, restaurant_name: str
                     if u2:
                         candidates.append((score_url(u2, ""), u2))
 
-        # then img tags
         for img in node.find_all("img"):
             u = _img_src_from_tag(img)
             if not u:
@@ -250,7 +244,7 @@ def og_image(url: str) -> Optional[str]:
 
 def _ok_for_og(url: str) -> bool:
     u = (url or "").lower()
-    # Skip OG images from source pages; they're often generic
+    # avoid generic OG images from source/listing pages
     if "eater.com" in u:
         return False
     if "blog.resy.com" in u:
@@ -272,19 +266,19 @@ def extract_resy_hit_list(html: str) -> List[Restaurant]:
     restaurants: List[Restaurant] = []
     headings = article.find_all(["h2", "h3"])
 
-    for h in headings:
+    for i, h in enumerate(headings):
         text = h.get_text(" ", strip=True)
         if not text:
             continue
 
-        # Heuristic filters to avoid non-entry headings
         if len(text) > 90:
             continue
+
         low = text.lower()
         if any(k in low for k in ["hit list", "where to eat", "updated", "read more", "the hit list"]):
             continue
 
-        # Filter out obvious non-restaurant / promo headings
+        # promo / utility headings
         if any(phrase in low for phrase in [
             "newest restaurant openings",
             "openings, now on resy",
@@ -304,16 +298,15 @@ def extract_resy_hit_list(html: str) -> List[Restaurant]:
         if len(name) < 2:
             continue
 
-        nodes = _entry_slice_nodes(h)
-        if not nodes:
-            continue
+        nodes = _entry_slice_nodes_from_list(headings, i)
 
         why = _first_paragraph_from_slice(nodes)
         image_url = _pick_image_from_slice(nodes, base_url=base_url, restaurant_name=name)
         url = _pick_link_from_slice(nodes, base_url=base_url, base_domain=base_domain)
 
-        # Structural gate: if we have none of the entry signals, it's probably a promo header
-        if not any([why, image_url, url]):
+        # Entry gate: require at least a blurb OR a useful link
+        # (images can be missing in static HTML)
+        if not (why or url):
             continue
 
         if not url:
@@ -341,37 +334,29 @@ def extract_eater_heatmap(html: str) -> List[Restaurant]:
     article = soup.find("article") or soup
 
     restaurants: List[Restaurant] = []
-    for h in article.find_all(["h2", "h3"]):
+    headings = article.find_all(["h2", "h3"])
+
+    for i, h in enumerate(headings):
         title = h.get_text(" ", strip=True)
         if not title:
             continue
 
         low = title.lower()
 
-        # Keep filters, but allow single-word restaurant names (e.g., "Tera")
         if len(title) > 110:
             continue
         if any(k in low for k in ["the heatmap", "where to eat", "related", "updates"]):
             continue
 
-        # Skip a few known non-entry headings
-        if low in ("see more", "more maps in eater ny"):
-            continue
-        if low.startswith("more maps"):
+        if low in ("see more", "more maps in eater ny") or low.startswith("more maps"):
             continue
 
         name = title.strip()
-        nodes = _entry_slice_nodes(h)
-        if not nodes:
-            continue
+        nodes = _entry_slice_nodes_from_list(headings, i)
 
         why = _first_paragraph_from_slice(nodes)
         image_url = _pick_image_from_slice(nodes, base_url=base_url, restaurant_name=name)
         url = _pick_link_from_slice(nodes, base_url=base_url, base_domain=base_domain)
-
-        # Structural gate (helps avoid spurious headings)
-        if not any([why, image_url, url]):
-            continue
 
         if not url:
             a = h.find("a", href=True)
@@ -590,13 +575,13 @@ def main() -> None:
         else:
             items = []
 
+        print(f"{s.name}: extracted {len(items)} items")
         all_items.extend(items)
 
     merged = dedupe(all_items)
     for r in merged:
         r.sources = sorted(list(set(r.sources or [])))
 
-    # Fallback: only fill missing images from non-source pages
     for r in merged:
         if not r.image_url and r.url and _ok_for_og(r.url):
             r.image_url = og_image(r.url)
