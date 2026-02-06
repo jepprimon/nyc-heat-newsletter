@@ -23,7 +23,8 @@ from config import SOURCES, WEIGHTS, INTENSITY_KEYWORDS, SCARCITY_KEYWORDS
 @dataclass
 class Restaurant:
     name: str
-    url: Optional[str] = None
+    url: Optional[str] = None          # primary “reserve / info” link
+    image_url: Optional[str] = None    # thumbnail
     neighborhood: Optional[str] = None
     cuisine: Optional[str] = None
     why_hot: Optional[str] = None
@@ -68,43 +69,107 @@ def fetch_html(url: str, timeout: int = 45, retries: int = 4) -> str:
 
     raise last_err
 
+from urllib.parse import urljoin, urlparse
+
+def _abs_url(base: str, href: Optional[str]) -> Optional[str]:
+    if not href:
+        return None
+    return urljoin(base, href)
+
+def _is_useful_outbound(href: str, base_domain: str) -> bool:
+    try:
+        u = urlparse(href)
+        if not u.scheme.startswith("http"):
+            return False
+        # exclude same-domain “jump links” / navigation
+        if u.netloc.endswith(base_domain):
+            return False
+        return True
+    except Exception:
+        return False
+
+def _pick_primary_link(block, base_url: str, base_domain: str) -> Optional[str]:
+    # Prefer Resy/OpenTable links if present; else first outbound link.
+    links = [a.get("href") for a in block.find_all("a", href=True)]
+    links = [_abs_url(base_url, h) for h in links if h]
+    links = [h for h in links if h and h.startswith("http")]
+
+    priority = []
+    for h in links:
+        if "resy.com" in h or "opentable.com" in h:
+            priority.append(h)
+    if priority:
+        return priority[0]
+
+    for h in links:
+        if _is_useful_outbound(h, base_domain):
+            return h
+
+    # fallback: allow same-domain link if nothing else
+    return links[0] if links else None
+
+def _pick_image(block, base_url: str) -> Optional[str]:
+    # Try typical patterns: <figure><img>, or any img in the entry block.
+    img = None
+    fig = block.find("figure")
+    if fig:
+        img = fig.find("img")
+    if not img:
+        img = block.find("img")
+    if not img:
+        return None
+
+    src = img.get("src") or img.get("data-src") or img.get("srcset")
+    if not src:
+        return None
+
+    # If srcset, take first URL
+    if " " in src and "," in src:
+        src = src.split(",")[0].strip().split(" ")[0].strip()
+
+    return _abs_url(base_url, src)
 
 def extract_resy_hit_list(html: str) -> List[Restaurant]:
-    '''Extract restaurant headings + a nearby paragraph from the Resy Hit List NYC page.'''
+    base_url = "https://blog.resy.com"
+    base_domain = "resy.com"
     soup = BeautifulSoup(html, "lxml")
     article = soup.find("article") or soup
 
     restaurants: List[Restaurant] = []
-    headings = article.find_all(["h2", "h3"])
-
-    for h in headings:
+    for h in article.find_all(["h2", "h3"]):
         text = h.get_text(" ", strip=True)
-        if not text:
-            continue
-        if len(text) > 80:
+        if not text or len(text) > 80:
             continue
         if any(k in text.lower() for k in ["where", "hit list", "updated", "read more"]):
             continue
-
-        p = h.find_next("p")
-        why = p.get_text(" ", strip=True) if p else None
-
-        link = h.find("a")
-        url = link.get("href") if link else None
-        if url and url.startswith("/"):
-            url = "https://blog.resy.com" + url
 
         name = re.sub(r"^\s*\d+\.\s*", "", text).strip()
         if len(name) < 2:
             continue
 
-        restaurants.append(Restaurant(name=name, url=url, why_hot=why, sources=["Resy"]))
+        # Use the closest “section-ish” container as the entry block
+        block = h.find_parent(["section", "div"]) or article
+
+        p = h.find_next("p")
+        why = p.get_text(" ", strip=True) if p else None
+
+        url = _pick_primary_link(block, base_url=base_url, base_domain=base_domain)
+        image_url = _pick_image(block, base_url=base_url)
+
+        restaurants.append(Restaurant(
+            name=name,
+            url=url,
+            image_url=image_url,
+            why_hot=why,
+            sources=["Resy"],
+        ))
 
     return dedupe(restaurants)
 
 
 def extract_eater_heatmap(html: str) -> List[Restaurant]:
-    '''Extract restaurant headings + a nearby paragraph from an Eater heatmap page.'''
+    base_url = "https://ny.eater.com"
+    base_domain = "eater.com"
     soup = BeautifulSoup(html, "lxml")
     article = soup.find("article") or soup
 
@@ -116,13 +181,20 @@ def extract_eater_heatmap(html: str) -> List[Restaurant]:
         if any(k in title.lower() for k in ["map", "heatmap", "editors", "updated", "related"]):
             continue
 
+        block = h.find_parent(["section", "div"]) or article
         p = h.find_next("p")
         why = p.get_text(" ", strip=True) if p else None
 
-        a = h.find("a")
-        url = a.get("href") if a else None
+        url = _pick_primary_link(block, base_url=base_url, base_domain=base_domain)
+        image_url = _pick_image(block, base_url=base_url)
 
-        restaurants.append(Restaurant(name=title.strip(), url=url, why_hot=why, sources=["Eater"]))
+        restaurants.append(Restaurant(
+            name=title.strip(),
+            url=url,
+            image_url=image_url,
+            why_hot=why,
+            sources=["Eater"],
+        ))
 
     return dedupe(restaurants)
 
