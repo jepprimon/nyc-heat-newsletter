@@ -5,15 +5,15 @@ import smtplib
 import ssl
 import time
 import random
-import requests
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from typing import Dict, List, Optional, Tuple
+from urllib.parse import urljoin, urlparse
 
 import requests
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Tag
 from dateutil import tz
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
@@ -35,6 +35,10 @@ class Restaurant:
     notes: Optional[str] = None
 
 
+# ---------------------------
+# Utility helpers
+# ---------------------------
+
 def _norm_name(name: str) -> str:
     n = name.lower().strip()
     n = re.sub(r"[\u2019’]", "'", n)
@@ -43,18 +47,23 @@ def _norm_name(name: str) -> str:
     return n
 
 
+def _abs_url(base: str, href: Optional[str]) -> Optional[str]:
+    if not href:
+        return None
+    return urljoin(base, href)
+
+
 def fetch_html(url: str, timeout: int = 45, retries: int = 4) -> str:
     headers = {
-        "User-Agent": "nyc-heat-index-bot/1.0 (+https://github.com/)",
+        "User-Agent": "nyc-heat-index-bot/1.1 (+https://github.com/)",
         "Accept-Language": "en-US,en;q=0.9",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Connection": "close",
     }
 
-    last_err = None
+    last_err: Optional[Exception] = None
     for attempt in range(1, retries + 1):
         try:
-            # Separate connect and read timeouts: (connect, read)
             r = requests.get(url, headers=headers, timeout=(15, timeout))
             r.raise_for_status()
             return r.text
@@ -62,107 +71,151 @@ def fetch_html(url: str, timeout: int = 45, retries: int = 4) -> str:
                 requests.exceptions.ConnectTimeout,
                 requests.exceptions.ConnectionError) as e:
             last_err = e
-            # Exponential backoff + jitter
             sleep_s = min(60, (2 ** (attempt - 1)) * 2) + random.random()
             print(f"Fetch failed ({attempt}/{retries}) for {url}: {e}. Retrying in {sleep_s:.1f}s")
             time.sleep(sleep_s)
 
-    raise last_err
+    # If we got here, we failed all retries
+    if last_err:
+        raise last_err
+    raise RuntimeError(f"Failed to fetch {url} for unknown reasons.")
 
-from urllib.parse import urljoin, urlparse
 
-def _abs_url(base: str, href: Optional[str]) -> Optional[str]:
-    if not href:
-        return None
-    return urljoin(base, href)
+def _img_src_from_tag(img) -> Optional[str]:
+    # Common lazy-load patterns
+    for attr in ("src", "data-src", "data-lazy-src", "data-original", "data-url"):
+        v = img.get(attr)
+        if v:
+            return v.strip()
+
+    # srcset patterns: prefer the last (usually largest) candidate
+    srcset = img.get("srcset") or img.get("data-srcset")
+    if srcset:
+        candidates: List[str] = []
+        for part in srcset.split(","):
+            url = part.strip().split(" ")[0].strip()
+            if url:
+                candidates.append(url)
+        if candidates:
+            return candidates[-1]
+
+    return None
+
 
 def _is_useful_outbound(href: str, base_domain: str) -> bool:
     try:
         u = urlparse(href)
         if not u.scheme.startswith("http"):
             return False
-        # exclude same-domain “jump links” / navigation
+        # exclude same-domain navigation/anchors
         if u.netloc.endswith(base_domain):
             return False
         return True
     except Exception:
         return False
 
-def _pick_primary_link(block, base_url: str, base_domain: str) -> Optional[str]:
-    # Prefer Resy/OpenTable links if present; else first outbound link.
+
+def _pick_primary_link(block: Tag, base_url: str, base_domain: str) -> Optional[str]:
     links = [a.get("href") for a in block.find_all("a", href=True)]
     links = [_abs_url(base_url, h) for h in links if h]
     links = [h for h in links if h and h.startswith("http")]
 
-    priority = []
+    # Prefer booking platforms
     for h in links:
         if "resy.com" in h or "opentable.com" in h:
-            priority.append(h)
-    if priority:
-        return priority[0]
+            return h
 
+    # Otherwise, first outbound link
     for h in links:
         if _is_useful_outbound(h, base_domain):
             return h
 
-    # fallback: allow same-domain link if nothing else
+    # Fallback: anything
     return links[0] if links else None
 
-def _pick_image(block, base_url: str) -> Optional[str]:
-    # Try typical patterns: <figure><img>, or any img in the entry block.
-    img = None
-    fig = block.find("figure")
-    if fig:
-        img = fig.find("img")
-    if not img:
-        img = block.find("img")
-    if not img:
-        return None
 
-    src = img.get("src") or img.get("data-src") or img.get("srcset")
-    if not src:
-        return None
+def _pick_image_near_heading(h: Tag, base_url: str) -> Optional[str]:
+    """
+    Eater/Resy often place images near the entry but not nested directly under the heading's parent.
+    Strategy:
+      1) Search within a reasonable container ancestor for the first <img>.
+      2) If not found, scan siblings AFTER the heading until the next h2/h3.
+    """
+    # 1) container-first (usually the most reliable)
+    container = h.find_parent(["section", "article"]) or h.find_parent("div") or h.parent
+    if container and isinstance(container, Tag):
+        img = container.find("img")
+        if img:
+            src = _img_src_from_tag(img)
+            if src:
+                return _abs_url(base_url, src)
 
-    # If srcset, take first URL
-    if " " in src and "," in src:
-        src = src.split(",")[0].strip().split(" ")[0].strip()
+    # 2) sibling scan (good for “image between heading and paragraph” layouts)
+    for sib in h.next_siblings:
+        if isinstance(sib, Tag) and sib.name in ("h2", "h3"):
+            break
+        if not isinstance(sib, Tag):
+            continue
 
-    return _abs_url(base_url, src)
+        img = sib.find("img")
+        if img:
+            src = _img_src_from_tag(img)
+            if src:
+                return _abs_url(base_url, src)
+
+    return None
+
+
+# ---------------------------
+# Source extractors
+# ---------------------------
 
 def extract_resy_hit_list(html: str) -> List[Restaurant]:
     base_url = "https://blog.resy.com"
     base_domain = "resy.com"
+
     soup = BeautifulSoup(html, "lxml")
     article = soup.find("article") or soup
 
     restaurants: List[Restaurant] = []
-    for h in article.find_all(["h2", "h3"]):
+    headings = article.find_all(["h2", "h3"])
+
+    for h in headings:
         text = h.get_text(" ", strip=True)
-        if not text or len(text) > 80:
+        if not text:
             continue
-        if any(k in text.lower() for k in ["where", "hit list", "updated", "read more"]):
+
+        if len(text) > 90:
+            continue
+        low = text.lower()
+        if any(k in low for k in ["hit list", "where to eat", "updated", "read more", "the hit list"]):
             continue
 
         name = re.sub(r"^\s*\d+\.\s*", "", text).strip()
         if len(name) < 2:
             continue
 
-        # Use the closest “section-ish” container as the entry block
-        block = h.find_parent(["section", "div"]) or article
+        block = h.find_parent(["section", "article"]) or h.find_parent("div") or article
 
         p = h.find_next("p")
         why = p.get_text(" ", strip=True) if p else None
 
+        image_url = _pick_image_near_heading(h, base_url=base_url)
         url = _pick_primary_link(block, base_url=base_url, base_domain=base_domain)
-        image_url = _pick_image(block, base_url=base_url)
 
-        restaurants.append(Restaurant(
-            name=name,
-            url=url,
-            image_url=image_url,
-            why_hot=why,
-            sources=["Resy"],
-        ))
+        if not url:
+            a = h.find("a", href=True)
+            url = _abs_url(base_url, a["href"]) if a else None
+
+        restaurants.append(
+            Restaurant(
+                name=name,
+                url=url,
+                image_url=image_url,
+                why_hot=why,
+                sources=["Resy"],
+            )
+        )
 
     return dedupe(restaurants)
 
@@ -170,34 +223,53 @@ def extract_resy_hit_list(html: str) -> List[Restaurant]:
 def extract_eater_heatmap(html: str) -> List[Restaurant]:
     base_url = "https://ny.eater.com"
     base_domain = "eater.com"
+
     soup = BeautifulSoup(html, "lxml")
     article = soup.find("article") or soup
 
     restaurants: List[Restaurant] = []
     for h in article.find_all(["h2", "h3"]):
         title = h.get_text(" ", strip=True)
-        if not title or len(title) > 90:
-            continue
-        if any(k in title.lower() for k in ["map", "heatmap", "editors", "updated", "related"]):
+        if not title:
             continue
 
-        block = h.find_parent(["section", "div"]) or article
+        low = title.lower()
+        if len(title) > 110:
+            continue
+        if any(k in low for k in ["map", "heatmap", "the heatmap", "where to eat", "related", "updates"]):
+            continue
+        if len(title.split()) <= 1:
+            continue
+
+        name = title.strip()
+        block = h.find_parent(["section", "article"]) or h.find_parent("div") or article
+
         p = h.find_next("p")
         why = p.get_text(" ", strip=True) if p else None
 
+        image_url = _pick_image_near_heading(h, base_url=base_url)
         url = _pick_primary_link(block, base_url=base_url, base_domain=base_domain)
-        image_url = _pick_image(block, base_url=base_url)
 
-        restaurants.append(Restaurant(
-            name=title.strip(),
-            url=url,
-            image_url=image_url,
-            why_hot=why,
-            sources=["Eater"],
-        ))
+        if not url:
+            a = h.find("a", href=True)
+            url = _abs_url(base_url, a["href"]) if a else None
+
+        restaurants.append(
+            Restaurant(
+                name=name,
+                url=url,
+                image_url=image_url,
+                why_hot=why,
+                sources=["Eater"],
+            )
+        )
 
     return dedupe(restaurants)
 
+
+# ---------------------------
+# Merge / scoring / output
+# ---------------------------
 
 def dedupe(items: List[Restaurant]) -> List[Restaurant]:
     seen: Dict[str, Restaurant] = {}
@@ -209,6 +281,7 @@ def dedupe(items: List[Restaurant]) -> List[Restaurant]:
             e = seen[key]
             e.sources = sorted(list(set((e.sources or []) + (r.sources or []))))
             e.url = e.url or r.url
+            e.image_url = e.image_url or r.image_url
             e.why_hot = e.why_hot or r.why_hot
             e.neighborhood = e.neighborhood or r.neighborhood
             e.cuisine = e.cuisine or r.cuisine
@@ -267,7 +340,7 @@ def reservation_intel(r: Restaurant) -> Tuple[str, str]:
     elif platform == "Resy" or "resy" in text:
         tip = "Use Resy: check common drop times (often mornings), enable notifications, and target bar/counter seats."
     elif platform == "OpenTable" or "opentable" in text:
-        tip = "Use OpenTable: book 1–2 weeks out, then set alerts for earlier times and watch for last‑minute openings."
+        tip = "Use OpenTable: book 1–2 weeks out, then set alerts for earlier times and watch for last-minute openings."
     else:
         tip = "Book ahead where possible; otherwise aim for off-peak (early/late) and consider bar seating."
 
@@ -300,7 +373,7 @@ def compute_heat(restaurants: List[Restaurant], last_month_names: List[str]) -> 
 
 
 def render_newsletter(output_dir: str, restaurants: List[Restaurant]) -> Tuple[str, str]:
-    tz_name = os.environ.get("TIMEZONE", "America/New_York")
+    tz_name = os.environ.get("TIMEZONE") or "America/New_York"
     local_tz = tz.gettz(tz_name)
 
     now_local = datetime.now(timezone.utc).astimezone(local_tz)
@@ -325,10 +398,10 @@ def render_newsletter(output_dir: str, restaurants: List[Restaurant]) -> Tuple[s
     os.makedirs(output_dir, exist_ok=True)
     out_path = os.path.join(output_dir, f"issue-{issue_slug}.html")
     index_path = os.path.join(output_dir, "index.html")
-    
+
     with open(index_path, "w", encoding="utf-8") as f:
         f.write(html)
-    
+
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(html)
 
@@ -336,18 +409,29 @@ def render_newsletter(output_dir: str, restaurants: List[Restaurant]) -> Tuple[s
 
 
 def send_email(subject: str, html_body: str) -> None:
-    dry_run = os.environ.get("DRY_RUN", "").lower() in ("1", "true", "yes")
-    subscribers = [e.strip() for e in os.environ.get("SUBSCRIBERS", "").split(",") if e.strip()]
+    dry_run = (os.environ.get("DRY_RUN") or "").lower() in ("1", "true", "yes")
+
+    # If DRY_RUN, skip SMTP entirely (still generate/publish Pages)
+    if dry_run:
+        print("DRY_RUN enabled: skipping SMTP send.")
+        return
+
+    subscribers = [e.strip() for e in (os.environ.get("SUBSCRIBERS") or "").split(",") if e.strip()]
     if not subscribers:
         raise RuntimeError("SUBSCRIBERS secret is empty. Provide comma-separated emails.")
 
-    host = os.environ["SMTP_HOST"]
-    port = int(os.environ.get("SMTP_PORT", "587"))
-    username = os.environ["SMTP_USERNAME"]
-    password = os.environ["SMTP_PASSWORD"]
-    from_email = os.environ.get("FROM_EMAIL", username)
-    from_name = os.environ.get("FROM_NAME", "NYC Heat Index")
-    reply_to = os.environ.get("REPLY_TO", "")
+    host = (os.environ.get("SMTP_HOST") or "").strip()
+    username = (os.environ.get("SMTP_USERNAME") or "").strip()
+    password = (os.environ.get("SMTP_PASSWORD") or "").strip()
+    if not host or not username or not password:
+        raise RuntimeError("SMTP secrets missing/blank. Set SMTP_HOST/SMTP_USERNAME/SMTP_PASSWORD (and optionally SMTP_PORT).")
+
+    port_raw = (os.environ.get("SMTP_PORT") or "").strip()
+    port = int(port_raw) if port_raw else 587
+
+    from_email = (os.environ.get("FROM_EMAIL") or username).strip()
+    from_name = (os.environ.get("FROM_NAME") or "NYC Heat Index").strip()
+    reply_to = (os.environ.get("REPLY_TO") or "").strip()
 
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
@@ -358,10 +442,6 @@ def send_email(subject: str, html_body: str) -> None:
         msg["Reply-To"] = reply_to
 
     msg.attach(MIMEText(html_body, "html", "utf-8"))
-
-    if dry_run:
-        print("DRY_RUN enabled: not sending email. Would have sent to:", len(subscribers), "subscribers")
-        return
 
     context = ssl.create_default_context()
     with smtplib.SMTP(host, port) as server:
