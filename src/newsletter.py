@@ -69,7 +69,7 @@ def _abs_url(base: str, href: Optional[str]) -> Optional[str]:
 
 def fetch_html(url: str, timeout: int = 45, retries: int = 4) -> str:
     headers = {
-        "User-Agent": "nyc-heat-index-bot/3.1 (+https://github.com/)",
+        "User-Agent": "nyc-heat-index-bot/3.2 (+https://github.com/)",
         "Accept-Language": "en-US,en;q=0.9",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Connection": "close",
@@ -115,29 +115,24 @@ def _resy_clean_heading_text(h: Tag) -> str:
         return text
 
     for t in h2.find_all(["span", "a", "small"]):
-        # Be defensive: bs4 can produce elements with attrs=None
         if not isinstance(t, Tag):
             continue
 
-        attrs = t.attrs or {}  # ✅ avoid None
+        attrs = t.attrs or {}
         txt = t.get_text(" ", strip=True)
         txt_low = (txt or "").lower()
         aria_low = (attrs.get("aria-label") or "").lower()
         cls_low = " ".join(attrs.get("class", [])).lower() if attrs.get("class") else ""
 
-        # Remove nodes that are plainly map UI
         if txt_low in ("map", "view map") or txt_low.endswith(" map") or "map" in aria_low:
             t.decompose()
             continue
-
-        # Remove class-driven map badges
         if "map" in cls_low and len(txt_low) <= 20:
             t.decompose()
             continue
 
     text = h2.get_text(" ", strip=True)
     text = re.sub(r"\s+map\s*$", "", text, flags=re.I).strip()
-    # If some variant leaves "Hudson Square map" at the end, strip trailing "... map"
     text = re.sub(r"\s+[A-Za-z][A-Za-z '&.-]{1,40}\s+map\s*$", "", text, flags=re.I).strip()
     return text
 
@@ -161,17 +156,34 @@ def _entry_slice_nodes_from_list(headings: List[Tag], idx: int) -> List[Tag]:
     return _collect_between(headings[idx], end)
 
 
-def _first_paragraph_from_slice(nodes: List[Tag]) -> Optional[str]:
+def _first_real_paragraph_from_slice(nodes: List[Tag]) -> Optional[str]:
+    """
+    Skip UI cruft like “View in list”, “View in map”, etc.
+    Prefer a real descriptive paragraph (length threshold).
+    """
+    bad_exact = {"view in list", "view in map", "map", "read more"}
     for node in nodes:
+        if not isinstance(node, Tag):
+            continue
+
+        ps: List[Tag] = []
         if node.name == "p":
-            txt = node.get_text(" ", strip=True)
-            if txt:
-                return txt
-        p = node.find("p")
-        if p:
+            ps.append(node)
+        ps.extend(node.find_all("p"))
+
+        for p in ps:
             txt = p.get_text(" ", strip=True)
-            if txt:
-                return txt
+            if not txt:
+                continue
+            low = txt.lower().strip()
+            if low in bad_exact:
+                continue
+            if low.startswith(("view in ", "see more", "discover more")):
+                continue
+            if len(txt) < 40:
+                continue
+            return txt
+
     return None
 
 
@@ -314,7 +326,7 @@ def _pick_image_from_slice(
 
 
 # ---------------------------
-# OG image fallback (restricted; allows Eater venue pages)
+# OG image fallback (restricted; do NOT use for Resy-only cards)
 # ---------------------------
 
 def og_image(url: str) -> Optional[str]:
@@ -331,10 +343,16 @@ def og_image(url: str) -> Optional[str]:
 
 def _ok_for_og(url: str) -> bool:
     u = (url or "").lower()
-    # Allow Eater venue pages only (fills gaps like Babbo/Babbo-like entries)
+    # Allow Eater venue pages only
     if "ny.eater.com/venue/" in u:
         return True
-    # Otherwise keep conservative blocks
+
+    # Block booking redirectors/aggregators (often generic OG images)
+    if "reservations.safegraph.com" in u:
+        return False
+    if "exploretock.com" in u:
+        return False
+
     if "eater.com" in u:
         return False
     if "blog.resy.com" in u:
@@ -388,7 +406,7 @@ def _looks_like_restaurant_name(name: str) -> bool:
 
 
 # ---------------------------
-# Resy URL gating + strict image picking
+# Resy URL gating + strict image picking (Hit List ONLY)
 # ---------------------------
 
 def _is_resy_restaurant_booking_url(url: str) -> bool:
@@ -437,13 +455,20 @@ def _is_resy_restaurant_booking_url(url: str) -> bool:
     return False
 
 
+def _is_legit_resy_hitlist_photo(u: str) -> bool:
+    # IMPORTANT: only accept photos that appear on the Hit List page itself
+    # and come from Resy's image CDN.
+    u_low = (u or "").lower()
+    return u_low.startswith("https://image.resy.com/")
+
+
 _RESY_IMAGE_STOP_PHRASES = ("discover more", "craving something else", "craving something else?")
 
 
 def _pick_resy_image_for_heading(h: Tag, base_url: str, restaurant_name: str) -> Optional[str]:
     """
-    Scan forward from a numbered restaurant heading until next numbered heading
-    or stop phrase, and pick the best (non-logo) image. If uncertain, return None.
+    Hit List ONLY: scan forward from the heading and accept only image.resy.com photos.
+    If none found in the entry itself, return None (so default wordmark applies).
     """
     name_norm = _norm_name(restaurant_name)
     best_score = -10_000
@@ -453,12 +478,32 @@ def _pick_resy_image_for_heading(h: Tag, base_url: str, restaurant_name: str) ->
         u_low = (u or "").lower()
         alt_norm = _norm_name(alt or "")
         s = 0
+
+        # hard reject known junk
+        hard_reject = [
+            "s3.amazonaws.com/resy.com/images/social/",
+            "facebook-preview",
+            "/social/",
+            "/icons/",
+            "/icon/",
+            "/logo",
+            "placeholder",
+            "sprite",
+            "spinner",
+        ]
+        if any(x in u_low for x in hard_reject):
+            return -10_000
+
+        # we only allow resy photo CDN anyway, but keep this for safety
+        if not _is_legit_resy_hitlist_photo(u_low):
+            return -10_000
+
+        # strong preference: alt matches restaurant name
         if name_norm and name_norm in alt_norm:
-            s += 60
-        if any(bad in u_low for bad in ["logo", "icon", "avatar", "placeholder", "sprite", "spinner"]):
-            s -= 60
-        if u_low.endswith(".svg"):
-            s -= 40
+            s += 80
+        else:
+            s -= 20
+
         return s
 
     steps = 0
@@ -466,7 +511,7 @@ def _pick_resy_image_for_heading(h: Tag, base_url: str, restaurant_name: str) ->
         if not isinstance(el, Tag):
             continue
         steps += 1
-        if steps > 200:
+        if steps > 220:
             break
 
         if el.name in ("h2", "h3", "h4"):
@@ -484,7 +529,7 @@ def _pick_resy_image_for_heading(h: Tag, base_url: str, restaurant_name: str) ->
                 u = _src_from_source_tag(src)
                 if u:
                     u2 = _abs_url(base_url, u)
-                    if u2:
+                    if u2 and _is_legit_resy_hitlist_photo(u2):
                         sc = score(u2, "")
                         if sc > best_score:
                             best_score, best_url = sc, u2
@@ -494,13 +539,14 @@ def _pick_resy_image_for_heading(h: Tag, base_url: str, restaurant_name: str) ->
             if not u:
                 continue
             u2 = _abs_url(base_url, u)
-            if not u2:
+            if not u2 or not _is_legit_resy_hitlist_photo(u2):
                 continue
             sc = score(u2, img.get("alt", "") or "")
             if sc > best_score:
                 best_score, best_url = sc, u2
 
-    return best_url if best_score >= 0 else None
+    # Only accept confident matches; otherwise force default
+    return best_url if best_score >= 60 else None
 
 
 # ---------------------------
@@ -602,7 +648,7 @@ def extract_resy_hit_list(html: str) -> List[Restaurant]:
             continue
 
         nodes = _entry_slice_nodes_from_list(headings, i)
-        why = _first_paragraph_from_slice(nodes)
+        why = _first_real_paragraph_from_slice(nodes)
 
         image_url = _pick_resy_image_for_heading(h, base_url=base_url, restaurant_name=name)
 
@@ -662,7 +708,7 @@ def extract_eater_heatmap(html: str) -> List[Restaurant]:
         name = title
         nodes = _entry_slice_nodes_from_list(headings, i)
 
-        why = _first_paragraph_from_slice(nodes)
+        why = _first_real_paragraph_from_slice(nodes)
         image_url = _pick_image_from_slice(
             nodes,
             base_url=base_url,
@@ -670,7 +716,21 @@ def extract_eater_heatmap(html: str) -> List[Restaurant]:
             max_tags_to_scan=40,
             stop_on_modules=True,
         )
-        url = _pick_link_from_slice(nodes, base_url=base_url, base_domain=base_domain)
+
+        # Prefer Eater venue links if present
+        venue = None
+        for node in nodes:
+            if not isinstance(node, Tag):
+                continue
+            for a in node.find_all("a", href=True):
+                u = _abs_url(base_url, a["href"])
+                if u and "ny.eater.com/venue/" in u:
+                    venue = u
+                    break
+            if venue:
+                break
+
+        url = venue or _pick_link_from_slice(nodes, base_url=base_url, base_domain=base_domain)
 
         if not url:
             a = h.find("a", href=True)
@@ -692,10 +752,6 @@ def extract_eater_heatmap(html: str) -> List[Restaurant]:
 # ---------------------------
 
 def dedupe(items: List[Restaurant]) -> List[Restaurant]:
-    """
-    Merge by normalized name.
-    Image precedence: if any merged record has an Eater image, use it.
-    """
     seen: Dict[str, Restaurant] = {}
 
     for r in items:
@@ -911,22 +967,28 @@ def main() -> None:
     for r in merged:
         r.sources = sorted(list(set(r.sources or [])))
 
-    # OG fill (capped) for allowed pages (includes Eater venue pages)
+    # OG fill (capped) — NEVER for Resy-only items
     og_filled = 0
     for r in merged:
         if og_filled >= 10:
             break
-        if not r.image_url and r.url and _ok_for_og(r.url):
+
+        is_resy_only = r.sources and ("Resy" in r.sources) and ("Eater" not in r.sources)
+        if is_resy_only:
+            continue  # IMPORTANT: do not pull images from elsewhere for Resy cards
+
+        if (not r.image_url) and r.url and _ok_for_og(r.url):
             img = og_image(r.url)
             if img:
                 r.image_url = img
                 og_filled += 1
 
-    # Default Resy wordmark ONLY for Resy-only items still missing an image.
+    # Default Resy image for Resy-only items missing a Hit List photo
     if DEFAULT_RESY_IMAGE:
         for r in merged:
-            if (not r.image_url) and r.sources and ("Resy" in r.sources) and ("Eater" not in r.sources):
-                r.image_url = DEFAULT_RESY_IMAGE
+            if r.sources and ("Resy" in r.sources) and ("Eater" not in r.sources):
+                if not r.image_url:
+                    r.image_url = DEFAULT_RESY_IMAGE
 
     compute_heat(merged, last_month_names)
 
