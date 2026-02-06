@@ -40,28 +40,10 @@ jobs:
         run: |
           python src/newsletter.py
 
-      - name: Publish issue to GitHub Pages (gh-pages)
-        run: |
-          set -e
-          ISSUE_FILE=$(ls -1 dist/issue-*.html | tail -n 1)
-          mkdir -p public
-          cp "$ISSUE_FILE" public/index.html
-          cp dist/issue-*.html public/ || true
-
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-
-          if git show-ref --quiet refs/heads/gh-pages; then
-            git checkout gh-pages
-          else
-            git checkout --orphan gh-pages
-            git rm -rf . || true
-          fi
-
-          rm -rf *
-          cp -r public/* .
-          rm -rf public
-
-          git add -A
-          git commit -m "Publish monthly issue" || echo "Nothing to commit"
-          git push -f origin gh-pages
+      - name: Deploy to GitHub Pages (gh-pages)
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_branch: gh-pages
+          publish_dir: ./dist
+          keep_files: true
