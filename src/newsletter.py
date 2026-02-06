@@ -19,6 +19,8 @@ from jinja2 import Environment, FileSystemLoader, select_autoescape
 
 from config import SOURCES, WEIGHTS, INTENSITY_KEYWORDS, SCARCITY_KEYWORDS
 
+DEFAULT_RESY_IMAGE = (os.environ.get("DEFAULT_RESY_IMAGE") or "").strip() or None
+
 
 @dataclass
 class Restaurant:
@@ -42,7 +44,6 @@ class Restaurant:
 def _strip_leading_numbering(name: str) -> str:
     if not name:
         return name
-    # handles: "18. Foo", "18) Foo", "18 - Foo", "18 — Foo", "18: Foo"
     return re.sub(r"^\s*\d+\s*[\.\)\-–—:]\s*", "", name).strip()
 
 
@@ -63,7 +64,7 @@ def _abs_url(base: str, href: Optional[str]) -> Optional[str]:
 
 def fetch_html(url: str, timeout: int = 45, retries: int = 4) -> str:
     headers = {
-        "User-Agent": "nyc-heat-index-bot/2.0 (+https://github.com/)",
+        "User-Agent": "nyc-heat-index-bot/2.3 (+https://github.com/)",
         "Accept-Language": "en-US,en;q=0.9",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Connection": "close",
@@ -87,6 +88,10 @@ def fetch_html(url: str, timeout: int = 45, retries: int = 4) -> str:
         raise last_err
     raise RuntimeError(f"Failed to fetch {url} for unknown reasons.")
 
+
+# ---------------------------
+# Image helpers (img/srcset/picture)
+# ---------------------------
 
 def _img_src_from_tag(img) -> Optional[str]:
     for attr in ("src", "data-src", "data-lazy-src", "data-original", "data-url"):
@@ -116,18 +121,6 @@ def _src_from_source_tag(source) -> Optional[str]:
         if url:
             candidates.append(url)
     return candidates[-1] if candidates else None
-
-
-def _is_useful_outbound(href: str, base_domain: str) -> bool:
-    try:
-        u = urlparse(href)
-        if not u.scheme.startswith("http"):
-            return False
-        if u.netloc.endswith(base_domain):
-            return False
-        return True
-    except Exception:
-        return False
 
 
 # ---------------------------
@@ -163,6 +156,18 @@ def _first_paragraph_from_slice(nodes: List[Tag]) -> Optional[str]:
     return None
 
 
+def _is_useful_outbound(href: str, base_domain: str) -> bool:
+    try:
+        u = urlparse(href)
+        if not u.scheme.startswith("http"):
+            return False
+        if u.netloc.endswith(base_domain):
+            return False
+        return True
+    except Exception:
+        return False
+
+
 def _pick_link_from_slice(nodes: List[Tag], base_url: str, base_domain: str) -> Optional[str]:
     hrefs: List[str] = []
     for node in nodes:
@@ -183,27 +188,17 @@ def _pick_link_from_slice(nodes: List[Tag], base_url: str, base_domain: str) -> 
 
 
 # ---------------------------
-# Image picking: proximity + module-boundary guards
+# Image picking for Eater (stop before modules)
 # ---------------------------
 
-_EATER_STOP_WORDS = {
-    "see more",
-    "related",
-    "more maps",
-    "more maps in eater ny",
-    "you might also like",
-}
+_EATER_STOP_WORDS = {"see more", "related", "more maps", "more maps in eater ny", "you might also like"}
 
 
 def _hit_stop_boundary(node: Tag) -> bool:
     if node.name in ("aside", "footer", "nav"):
         return True
     txt = node.get_text(" ", strip=True).lower() if isinstance(node, Tag) else ""
-    if txt:
-        for w in _EATER_STOP_WORDS:
-            if w in txt:
-                return True
-    return False
+    return any(w in txt for w in _EATER_STOP_WORDS)
 
 
 def _pick_image_from_slice(
@@ -291,34 +286,21 @@ def _ok_for_og(url: str) -> bool:
 
 
 # ---------------------------
-# Name heuristics + Resy-specific URL gating
+# Name heuristics
 # ---------------------------
 
 _BAD_NAME_FRAGMENTS = [
-    "newest restaurant openings",
-    "now on resy",
-    "newsletter",
-    "sign up",
-    "subscribe",
-    "follow us",
-    "gift card",
-    "resy events",
-    "private dining",
-    "more from resy",
-    "read more",
-    "updated",
-    "where to eat",
-    "the hit list",
-    "the heatmap",
+    "newest restaurant openings", "now on resy", "newsletter", "sign up", "subscribe",
+    "follow us", "gift card", "resy events", "private dining", "more from resy",
+    "read more", "updated", "where to eat", "the hit list", "the heatmap",
 ]
 
-# hard nav/footer junk that should never become a card
 _REJECT_EXACT = {
-    "about", "careers", "nearby restaurants", "climbing", "top rated", "new on resy",
-    "events", "features", "plans & pricing", "why resy os", "request a demo",
-    "resy help desk", "global privacy policy", "terms of service", "cookie policy",
-    "accessibility statement", "resy os overview", "resy os dashboard",
-    "for restaurants", "resy", "get resy emails", "the resy credit", "global dining access",
+    "about", "careers", "nearby restaurants", "top rated", "new on resy", "events",
+    "features", "plans & pricing", "why resy os", "request a demo", "resy help desk",
+    "global privacy policy", "terms of service", "cookie policy", "accessibility statement",
+    "resy os overview", "resy os dashboard", "for restaurants", "resy", "get resy emails",
+    "the resy credit", "global dining access", "discover more", "craving something else",
 }
 
 
@@ -348,49 +330,27 @@ def _looks_like_restaurant_name(name: str) -> bool:
     return True
 
 
-def _is_title_case(name: str) -> bool:
-    words = [w for w in _strip_leading_numbering(name).split() if w]
-    if not words:
-        return False
-    if len(words) == 1:
-        return words[0][:1].isupper()
-    lowers = {"of", "and", "the", "la", "le", "el", "de", "da", "di", "del"}
-    ok = 0
-    for w in words:
-        if w.lower() in lowers:
-            ok += 1
-        elif w[:1].isupper():
-            ok += 1
-    return ok >= len(words) - 1
-
+# ---------------------------
+# Resy URL gating + stopping logic
+# ---------------------------
 
 def _is_resy_restaurant_booking_url(url: str) -> bool:
-    """
-    Accept Resy/OpenTable URLs that plausibly point to a restaurant booking/venue page.
-    Resy venue URLs commonly appear as:
-      - https://resy.com/cities/ny/<restaurant-slug>
-      - https://resy.com/cities/ny/venues/<slug>
-      - https://resy.com/cities/ny/places/<slug>
-      - https://resy.com/r/<slug>
-    Reject OS/legal/help/marketing/etc.
-    """
     if not url:
         return False
     u = url.lower()
 
-    # OpenTable is fine
+    # OpenTable: allow
     if "opentable.com" in u:
         return True
 
     if "resy.com" not in u:
         return False
 
-    # hard rejects (marketing / product / legal / help)
+    # reject marketing/help/legal/os
     reject_fragments = [
         "resy-os", "/os", "help", "privacy", "terms", "cookie", "accessibility",
         "/about", "/careers", "/press", "/for-restaurants", "/request-a-demo",
-        "pricing", "features", "dashboard", "overview",
-        "/gift", "/gifts", "/credit",
+        "pricing", "features", "dashboard", "overview", "/gift", "/gifts", "/credit",
     ]
     if any(frag in u for frag in reject_fragments):
         return False
@@ -400,18 +360,16 @@ def _is_resy_restaurant_booking_url(url: str) -> bool:
     except Exception:
         return False
 
-    # easy allow patterns
     if "/r/" in path:
         return True
     if "/venues/" in path or "/places/" in path or "/restaurants/" in path:
         return True
 
-    # allow /cities/<city>/<slug> where slug is not a generic category page
+    # allow /cities/<city>/<slug> (not generic category pages)
     if path.startswith("/cities/"):
-        parts = [p for p in path.split("/") if p]  # e.g. ['cities','ny','wild-cherry']
+        parts = [p for p in path.split("/") if p]
         if len(parts) >= 3:
             slug = parts[2]
-            # reject non-restaurant city subpages
             bad_slugs = {
                 "search", "nearby", "neighborhoods", "guides", "collections",
                 "events", "top-rated", "top", "new", "new-on-resy", "restaurants",
@@ -419,124 +377,11 @@ def _is_resy_restaurant_booking_url(url: str) -> bool:
             }
             if slug in bad_slugs:
                 return False
-            # also reject if it's clearly a category path like /cities/ny/neighborhoods/...
             if len(parts) >= 4 and parts[2] in bad_slugs:
                 return False
             return True
 
     return False
-
-
-def _resy_name_from_context(a: Tag) -> Optional[str]:
-    """
-    Resy blog often has booking links with anchor text like 'Reserve' or 'Get Resy alerts'.
-    This tries to infer the restaurant name from nearby context:
-      - nearest previous strong/b within same paragraph/section
-      - nearest previous h2/h3
-      - aria-label/title attributes
-    """
-    # 1) aria-label / title sometimes contains name
-    for attr in ("aria-label", "title"):
-        v = a.get(attr)
-        if v:
-            cand = _strip_leading_numbering(v.strip())
-            if _looks_like_restaurant_name(cand):
-                return cand
-
-    # 2) look within the same paragraph/container for strong/b text
-    container = a.find_parent(["p", "li", "div", "section", "article"])
-    if container:
-        strong = container.find(["strong", "b"])
-        if strong:
-            cand = _strip_leading_numbering(strong.get_text(" ", strip=True))
-            if _looks_like_restaurant_name(cand):
-                return cand
-
-    # 3) walk backwards through previous elements for a nearby name-like heading/strong
-    steps = 0
-    for el in a.previous_elements:
-        if not isinstance(el, Tag):
-            continue
-        steps += 1
-        if steps > 120:  # keep it local
-            break
-        if el.name in ("h2", "h3"):
-            cand = _strip_leading_numbering(el.get_text(" ", strip=True))
-            if _looks_like_restaurant_name(cand):
-                return cand
-        if el.name in ("strong", "b"):
-            cand = _strip_leading_numbering(el.get_text(" ", strip=True))
-            if _looks_like_restaurant_name(cand):
-                return cand
-
-    return None
-
-
-def _fallback_from_outbound_links_resy(scope: Tag, base_url: str) -> List[Restaurant]:
-    """
-    Tight-but-correct Resy fallback:
-      - only inside article scope (no footer/nav)
-      - only accept links that look like restaurant/venue booking URLs
-      - if anchor text isn't a restaurant name, infer it from context
-    """
-    out: List[Restaurant] = []
-    seen: set[str] = set()
-
-    for a in scope.find_all("a", href=True):
-        href = _abs_url(base_url, a.get("href"))
-        if not href or not href.startswith("http"):
-            continue
-        if not _is_resy_restaurant_booking_url(href):
-            continue
-
-        raw_text = _strip_leading_numbering(a.get_text(" ", strip=True))
-        name = raw_text if _looks_like_restaurant_name(raw_text) else _resy_name_from_context(a)
-        if not name:
-            continue
-
-        name = _strip_leading_numbering(name)
-        if not _looks_like_restaurant_name(name):
-            continue
-
-        # Extra guard: avoid single generic words like "About", "Events"
-        if name.lower() in _REJECT_EXACT:
-            continue
-
-        key = _norm_name(name)
-        if key in seen:
-            continue
-        seen.add(key)
-
-        out.append(Restaurant(name=name, url=href, sources=["Resy"]))
-
-    return out
-
-
-def _fallback_from_outbound_links_generic(scope: Tag, base_url: str, source_label: str) -> List[Restaurant]:
-    soup = scope
-    out: List[Restaurant] = []
-    seen: set[str] = set()
-
-    for a in soup.find_all("a", href=True):
-        href = _abs_url(base_url, a.get("href"))
-        if not href or not href.startswith("http"):
-            continue
-        hlow = href.lower()
-        if not (("resy.com" in hlow) or ("opentable.com" in hlow)):
-            continue
-
-        text = _strip_leading_numbering(a.get_text(" ", strip=True))
-        if not _looks_like_restaurant_name(text):
-            continue
-
-        key = _norm_name(text)
-        if key in seen:
-            continue
-        seen.add(key)
-
-        out.append(Restaurant(name=text, url=href, sources=[source_label]))
-
-    return out
 
 
 # ---------------------------
@@ -552,39 +397,25 @@ def extract_resy_hit_list(html: str) -> List[Restaurant]:
     def score_scope(tag: Optional[Tag]) -> int:
         if not tag or not isinstance(tag, Tag):
             return -1
-        # Weight things that indicate real article content
         p = len(tag.find_all("p"))
         h = len(tag.find_all(["h2", "h3", "h4"]))
         b = len(tag.find_all(["strong", "b"]))
-        # Text length helps distinguish real post body vs nav widgets
         txt_len = len(tag.get_text(" ", strip=True))
         return (p * 6) + (h * 10) + (b * 3) + (txt_len // 1000)
 
-    # Candidate scopes (Resy page markup varies)
     candidates: List[Tag] = []
     candidates.extend(soup.find_all("article"))
     candidates.extend(soup.find_all("main"))
-
-    sel = soup.select(
-        ".entry-content, .post-content, .article-content, .content, "
-        ".single-content, .post__content, [data-testid='post-content']"
-    )
-    candidates.extend([t for t in sel if isinstance(t, Tag)])
-
+    candidates.extend([
+        t for t in soup.select(
+            ".entry-content, .post-content, .article-content, .content, "
+            ".single-content, .post__content, [data-testid='post-content']"
+        ) if isinstance(t, Tag)
+    ])
     if soup.body:
         candidates.append(soup.body)
 
-    # Pick the most content-dense scope
     scope = max(candidates, key=score_scope) if candidates else (soup.body or soup)
-
-    # Basic “blocked/consent” warning (keep, but don’t hard fail)
-    page_text = soup.get_text(" ", strip=True).lower()
-    if any(k in page_text for k in [
-        "access denied", "request blocked", "unusual traffic", "verify you are human",
-        "captcha", "enable cookies", "consent", "gdpr"
-    ]):
-        title = (soup.title.get_text(" ", strip=True) if soup.title else "")
-        print(f"[Resy] WARNING: page looks blocked/consent-gated. title='{title}' text_len={len(page_text)}")
 
     def in_nav(tag: Tag) -> bool:
         for p in tag.parents:
@@ -595,10 +426,67 @@ def extract_resy_hit_list(html: str) -> List[Restaurant]:
                 return True
         return False
 
+    RESY_STOP_PHRASES = (
+        "discover more", "recommended", "more from resy", "related",
+        "you might also like", "craving something else", "craving something else?",
+    )
+
+    def is_stop_heading(h: Tag) -> bool:
+        txt = h.get_text(" ", strip=True).lower()
+        return any(p in txt for p in RESY_STOP_PHRASES)
+
+    def leading_num(text: str) -> Optional[int]:
+        m = re.match(r"^\s*(\d{1,3})\s*[\.\)\-–—:]\s*", text or "")
+        return int(m.group(1)) if m else None
+
+    def is_numbered_restaurant_heading(h: Tag) -> bool:
+        raw = h.get_text(" ", strip=True)
+        n = leading_num(raw)
+        if n is None:
+            return False
+        name = _strip_leading_numbering(raw)
+        return _looks_like_restaurant_name(name)
+
+    headings_all = [h for h in scope.find_all(["h2", "h3", "h4"]) if not in_nav(h)]
+
+    stop_idx: Optional[int] = None
+    for idx, h in enumerate(headings_all):
+        if is_stop_heading(h):
+            stop_idx = idx
+            break
+
+    last_num_idx: Optional[int] = None
+    last_num_value: Optional[int] = None
+    for idx, h in enumerate(headings_all):
+        if is_numbered_restaurant_heading(h):
+            n = leading_num(h.get_text(" ", strip=True))
+            if n is not None and (last_num_value is None or n >= last_num_value):
+                last_num_value = n
+                last_num_idx = idx
+
+    if last_num_idx is not None and stop_idx is not None and last_num_idx < stop_idx:
+        end_exclusive = last_num_idx + 1
+    elif stop_idx is not None:
+        end_exclusive = stop_idx
+    elif last_num_idx is not None:
+        end_exclusive = last_num_idx + 1
+    else:
+        end_exclusive = len(headings_all)
+
+    headings = headings_all[:end_exclusive]
+    boundary_heading: Optional[Tag] = headings_all[end_exclusive] if end_exclusive < len(headings_all) else None
+
+    def is_after_boundary(tag: Tag) -> bool:
+        if not boundary_heading:
+            return False
+        for el in tag.previous_elements:
+            if el is boundary_heading:
+                return True
+        return False
+
     restaurants: List[Restaurant] = []
 
-    # --- Heading-based extraction (allow h4 too; Resy sometimes uses it)
-    headings = [h for h in scope.find_all(["h2", "h3", "h4"]) if not in_nav(h)]
+    # Heading-based extraction
     for i, h in enumerate(headings):
         raw = h.get_text(" ", strip=True)
         name = _strip_leading_numbering(raw)
@@ -607,7 +495,6 @@ def extract_resy_hit_list(html: str) -> List[Restaurant]:
 
         nodes = _entry_slice_nodes_from_list(headings, i)
         why = _first_paragraph_from_slice(nodes)
-
         image_url = _pick_image_from_slice(
             nodes,
             base_url=base_url,
@@ -615,7 +502,6 @@ def extract_resy_hit_list(html: str) -> List[Restaurant]:
             max_tags_to_scan=90,
             stop_on_modules=False,
         )
-
         url = _pick_link_from_slice(nodes, base_url=base_url, base_domain=base_domain)
         if url and not _is_resy_restaurant_booking_url(url):
             url = None
@@ -628,11 +514,13 @@ def extract_resy_hit_list(html: str) -> List[Restaurant]:
             sources=["Resy"],
         ))
 
-    # --- Strong/b fallback (Resy often has bold restaurant names in paragraphs)
+    # Strong/b fallback (only before boundary)
     if len(restaurants) < 8:
         for p in scope.find_all("p"):
             if in_nav(p):
                 continue
+            if is_after_boundary(p):
+                break
             strong = p.find(["strong", "b"])
             if not strong:
                 continue
@@ -654,24 +542,6 @@ def extract_resy_hit_list(html: str) -> List[Restaurant]:
                     url = href
                     break
 
-            if not url:
-                # look slightly ahead for a booking link
-                steps = 0
-                for el in p.next_elements:
-                    if isinstance(el, Tag):
-                        if el.name == "p":
-                            break
-                        for a2 in el.find_all("a", href=True):
-                            href2 = _abs_url(base_url, a2["href"])
-                            if href2 and _is_resy_restaurant_booking_url(href2):
-                                url = href2
-                                break
-                        if url:
-                            break
-                        steps += 1
-                        if steps > 120:
-                            break
-
             restaurants.append(Restaurant(
                 name=name,
                 url=url,
@@ -692,8 +562,10 @@ def extract_resy_hit_list(html: str) -> List[Restaurant]:
         cleaned.append(r)
 
     print(
-        f"[Resy] scope_tag={getattr(scope,'name',None)} scope_score={score_scope(scope)} "
-        f"headings={len(headings)} p={len(scope.find_all('p'))} extracted={len(cleaned)} html_len={len(html)}"
+        f"[Resy] scope_tag={getattr(scope,'name',None)} score={score_scope(scope)} "
+        f"headings_all={len(headings_all)} stop_idx={stop_idx} "
+        f"last_num={last_num_value} last_num_idx={last_num_idx} "
+        f"headings_used={len(headings)} extracted={len(cleaned)} html_len={len(html)}"
     )
     return cleaned
 
@@ -703,7 +575,7 @@ def extract_eater_heatmap(html: str) -> List[Restaurant]:
     base_domain = "eater.com"
 
     soup = BeautifulSoup(html, "lxml")
-    article = soup.find("article") or soup
+    article = soup.find("article") or soup.find("main") or soup
 
     restaurants: List[Restaurant] = []
     headings = article.find_all(["h2", "h3"])
@@ -730,23 +602,15 @@ def extract_eater_heatmap(html: str) -> List[Restaurant]:
             a = h.find("a", href=True)
             url = _abs_url(base_url, a["href"]) if a else None
 
-        restaurants.append(
-            Restaurant(
-                name=name,
-                url=url,
-                image_url=image_url,
-                why_hot=why,
-                sources=["Eater"],
-            )
-        )
+        restaurants.append(Restaurant(
+            name=name,
+            url=url,
+            image_url=image_url,
+            why_hot=why,
+            sources=["Eater"],
+        ))
 
-    restaurants = dedupe(restaurants)
-
-    if len(restaurants) < 5:
-        fb = _fallback_from_outbound_links_generic(article, base_url=base_url, source_label="Eater")
-        restaurants = dedupe(restaurants + fb)
-
-    return restaurants
+    return dedupe(restaurants)
 
 
 # ---------------------------
@@ -956,9 +820,16 @@ def main() -> None:
     for r in merged:
         r.sources = sorted(list(set(r.sources or [])))
 
+    # Optional: fill missing images via OG (non-Resy/Eater sources)
     for r in merged:
         if not r.image_url and r.url and _ok_for_og(r.url):
             r.image_url = og_image(r.url)
+
+    # Default Resy wordmark only for Resy-only entries that still have no image
+    if DEFAULT_RESY_IMAGE:
+        for r in merged:
+            if not r.image_url and r.sources and ("Resy" in r.sources) and ("Eater" not in r.sources):
+                r.image_url = DEFAULT_RESY_IMAGE
 
     compute_heat(merged, last_month_names)
 
