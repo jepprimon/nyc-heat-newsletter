@@ -548,13 +548,39 @@ def extract_resy_hit_list(html: str) -> List[Restaurant]:
     base_domain = "resy.com"
 
     soup = BeautifulSoup(html, "lxml")
-    article = soup.find("article") or soup  # keep scope tight
+
+    # 1) Pick the best content scope (Resy blog markup varies / can be A/B tested)
+    scope = (
+        soup.find("article")
+        or soup.find("main")
+        or soup.select_one(".entry-content, .post-content, .article-content, .content, [data-testid='post-content']")
+        or soup.body
+        or soup
+    )
+
+    # 2) Detect likely block/consent/bot pages early
+    page_text = soup.get_text(" ", strip=True).lower()
+    if any(k in page_text for k in [
+        "access denied", "request blocked", "unusual traffic", "verify you are human",
+        "captcha", "enable cookies", "consent", "gdpr"
+    ]):
+        title = (soup.title.get_text(" ", strip=True) if soup.title else "")
+        print(f"[Resy] WARNING: page looks blocked/consent-gated. title='{title}' text_len={len(page_text)}")
+        # still attempt extraction (sometimes it’s a false positive)
 
     restaurants: List[Restaurant] = []
 
-    headings = article.find_all(["h2", "h3"])
+    def in_nav(tag: Tag) -> bool:
+        for p in tag.parents:
+            if getattr(p, "name", None) in ("header", "footer", "nav", "aside"):
+                return True
+            cls = " ".join(p.get("class", [])).lower() if isinstance(p, Tag) else ""
+            if any(x in cls for x in ["footer", "nav", "menu", "header", "cookie", "consent"]):
+                return True
+        return False
 
-    # Heading-based extraction (best case)
+    # 3) Heading-based extraction across scope (but avoid nav/footer)
+    headings = [h for h in scope.find_all(["h2", "h3"]) if not in_nav(h)]
     for i, h in enumerate(headings):
         raw = h.get_text(" ", strip=True)
         name = _strip_leading_numbering(raw)
@@ -568,7 +594,7 @@ def extract_resy_hit_list(html: str) -> List[Restaurant]:
             nodes,
             base_url=base_url,
             restaurant_name=name,
-            max_tags_to_scan=80,
+            max_tags_to_scan=90,
             stop_on_modules=False,
         )
 
@@ -576,21 +602,70 @@ def extract_resy_hit_list(html: str) -> List[Restaurant]:
         if url and not _is_resy_restaurant_booking_url(url):
             url = None
 
-        restaurants.append(
-            Restaurant(
+        restaurants.append(Restaurant(
+            name=name,
+            url=url,
+            image_url=image_url,
+            why_hot=why,
+            sources=["Resy"],
+        ))
+
+    # 4) Strong/b fallback (Resy Hit List often formats names as bold in paragraphs)
+    #    This does NOT rely on link text being the name.
+    if len(restaurants) < 8:
+        for p in scope.find_all("p"):
+            if in_nav(p):
+                continue
+            strong = p.find(["strong", "b"])
+            if not strong:
+                continue
+
+            name = _strip_leading_numbering(strong.get_text(" ", strip=True))
+            if not _looks_like_restaurant_name(name):
+                continue
+
+            # why_hot: paragraph minus the bold name (best effort)
+            full_txt = p.get_text(" ", strip=True)
+            why = None
+            if full_txt:
+                why = re.sub(re.escape(strong.get_text(" ", strip=True)), "", full_txt, count=1).strip()
+                why = re.sub(r"^[\s:–—-]+", "", why).strip() or None
+
+            # booking link in this paragraph (or nearest following links)
+            url = None
+            for a in p.find_all("a", href=True):
+                href = _abs_url(base_url, a["href"])
+                if href and _is_resy_restaurant_booking_url(href):
+                    url = href
+                    break
+
+            if not url:
+                # look a little bit ahead in the DOM for a booking link
+                steps = 0
+                for el in p.next_elements:
+                    if isinstance(el, Tag):
+                        if el.name == "p":
+                            break
+                        a2 = el.find("a", href=True)
+                        if a2:
+                            href2 = _abs_url(base_url, a2["href"])
+                            if href2 and _is_resy_restaurant_booking_url(href2):
+                                url = href2
+                                break
+                        steps += 1
+                        if steps > 80:
+                            break
+
+            restaurants.append(Restaurant(
                 name=name,
                 url=url,
-                image_url=image_url,
+                image_url=None,
                 why_hot=why,
                 sources=["Resy"],
-            )
-        )
+            ))
 
-    # Always add fallback (it fills in missing entries where the booking link is "Reserve")
-    fb = _fallback_from_outbound_links_resy(article, base_url=base_url)
-    restaurants = dedupe(restaurants + fb)
-
-    # Final cleanup
+    # 5) Final dedupe + cleanup
+    restaurants = dedupe(restaurants)
     cleaned: List[Restaurant] = []
     for r in restaurants:
         r.name = _strip_leading_numbering(r.name)
@@ -600,6 +675,7 @@ def extract_resy_hit_list(html: str) -> List[Restaurant]:
             continue
         cleaned.append(r)
 
+    print(f"[Resy] headings={len(headings)} extracted={len(cleaned)} scope_tag={getattr(scope,'name',None)} html_len={len(html)}")
     return cleaned
 
 
