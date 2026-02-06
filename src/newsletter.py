@@ -55,7 +55,7 @@ def _abs_url(base: str, href: Optional[str]) -> Optional[str]:
 
 def fetch_html(url: str, timeout: int = 45, retries: int = 4) -> str:
     headers = {
-        "User-Agent": "nyc-heat-index-bot/1.8 (+https://github.com/)",
+        "User-Agent": "nyc-heat-index-bot/1.9 (+https://github.com/)",
         "Accept-Language": "en-US,en;q=0.9",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Connection": "close",
@@ -95,7 +95,6 @@ def _img_src_from_tag(img) -> Optional[str]:
                 candidates.append(url)
         if candidates:
             return candidates[-1]
-
     return None
 
 
@@ -176,7 +175,7 @@ def _pick_link_from_slice(nodes: List[Tag], base_url: str, base_domain: str) -> 
 
 
 # ---------------------------
-# Image picking: proximity + module-boundary guards (fixes "See more" bleed)
+# Image picking: proximity + module-boundary guards
 # ---------------------------
 
 _EATER_STOP_WORDS = {
@@ -207,11 +206,6 @@ def _pick_image_from_slice(
     max_tags_to_scan: int = 60,
     stop_on_modules: bool = True,
 ) -> Optional[str]:
-    """
-    Pick an image for a restaurant from its entry slice with two protections:
-      - Only scan the first `max_tags_to_scan` Tag nodes (proximity constraint)
-      - Stop early if we hit "See more / Related" module boundaries
-    """
     name_norm = _norm_name(restaurant_name)
     candidates: List[Tuple[int, str]] = []
 
@@ -231,11 +225,9 @@ def _pick_image_from_slice(
     for node in nodes:
         if not isinstance(node, Tag):
             continue
-
         scanned += 1
         if scanned > max_tags_to_scan:
             break
-
         if stop_on_modules and _hit_stop_boundary(node):
             break
 
@@ -261,7 +253,6 @@ def _pick_image_from_slice(
 
     if not candidates:
         return None
-
     candidates.sort(key=lambda x: x[0], reverse=True)
     return candidates[0][1]
 
@@ -292,7 +283,7 @@ def _ok_for_og(url: str) -> bool:
 
 
 # ---------------------------
-# Fallback extraction (prevents "blank newsletter")
+# Name heuristics + fallbacks (tightened for Resy)
 # ---------------------------
 
 _BAD_NAME_FRAGMENTS = [
@@ -320,15 +311,95 @@ def _looks_like_restaurant_name(name: str) -> bool:
     n = name.strip()
     if len(n) < 2 or len(n) > 80:
         return False
+
     low = n.lower()
+
+    # obvious UI / product items
+    if low in {
+        "resy",
+        "for restaurants",
+        "get resy emails",
+        "the resy credit",
+        "global dining access",
+        "here",
+    }:
+        return False
+
+    # reject dates like "Feb. 10"
+    if re.match(r"^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+\d{1,2}$", low):
+        return False
+
+    # reject "sentence-y" fragments commonly mis-captured
+    if low.startswith(("a ", "an ", "the ", "watch ", "viewing ", "buffet ", "four-course")):
+        return False
+
     if any(bad in low for bad in _BAD_NAME_FRAGMENTS):
         return False
+
     if re.fullmatch(r"[0-9\s\-/,:.]+", n):
         return False
+
     return True
 
 
+def _is_title_case(name: str) -> bool:
+    words = [w for w in name.split() if w]
+    if not words:
+        return False
+    if len(words) == 1:
+        return words[0][:1].isupper()
+    # allow one lowercase connector like "of", "and", "the"
+    lowers = {"of", "and", "the", "la", "le", "el", "de", "da", "di", "del"}
+    ok = 0
+    for w in words:
+        if w.lower() in lowers:
+            ok += 1
+        elif w[:1].isupper():
+            ok += 1
+    return ok >= len(words) - 1
+
+
+def _fallback_from_outbound_links_resy(html: str, base_url: str) -> List[Restaurant]:
+    """
+    Tight Resy fallback:
+    - Only accept links to resy.com/opentable.com
+    - Anchor text must look like a restaurant name AND be Title Case
+    """
+    soup = BeautifulSoup(html, "lxml")
+    out: List[Restaurant] = []
+    seen: set[str] = set()
+
+    for a in soup.find_all("a", href=True):
+        href = _abs_url(base_url, a.get("href"))
+        if not href or not href.startswith("http"):
+            continue
+        hlow = href.lower()
+
+        if not (("resy.com" in hlow) or ("opentable.com" in hlow)):
+            continue
+        if "blog.resy.com" in hlow:
+            continue
+
+        text = a.get_text(" ", strip=True)
+        if not _looks_like_restaurant_name(text):
+            continue
+        if not _is_title_case(text):
+            continue
+
+        key = _norm_name(text)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        out.append(Restaurant(name=text.strip(), url=href, sources=["Resy"]))
+
+    return out
+
+
 def _fallback_from_outbound_links(html: str, base_url: str, source_label: str) -> List[Restaurant]:
+    """
+    Generic fallback used for non-Resy sources (kept for completeness).
+    """
     soup = BeautifulSoup(html, "lxml")
     out: List[Restaurant] = []
     seen: set[str] = set()
@@ -372,17 +443,14 @@ def extract_resy_hit_list(html: str) -> List[Restaurant]:
     restaurants: List[Restaurant] = []
     headings = article.find_all(["h2", "h3"])
 
+    # Heading-based extraction
     for i, h in enumerate(headings):
         text = h.get_text(" ", strip=True)
-        if not _looks_like_restaurant_name(text):
-            continue
-
         name = re.sub(r"^\s*\d+\.\s*", "", text).strip()
         if not _looks_like_restaurant_name(name):
             continue
 
         nodes = _entry_slice_nodes_from_list(headings, i)
-
         why = _first_paragraph_from_slice(nodes)
         image_url = _pick_image_from_slice(nodes, base_url=base_url, restaurant_name=name, max_tags_to_scan=80, stop_on_modules=False)
         url = _pick_link_from_slice(nodes, base_url=base_url, base_domain=base_domain)
@@ -397,12 +465,24 @@ def extract_resy_hit_list(html: str) -> List[Restaurant]:
             )
         )
 
-    restaurants = dedupe(restaurants)
+    restaurants = dedupe([r for r in restaurants if _looks_like_restaurant_name(r.name)])
+
+    # Tight fallback: only if we got too few
     if len(restaurants) < 5:
-        fb = _fallback_from_outbound_links(html, base_url=base_url, source_label="Resy")
+        fb = _fallback_from_outbound_links_resy(html, base_url=base_url)
         restaurants = dedupe(restaurants + fb)
 
-    return [r for r in restaurants if _looks_like_restaurant_name(r.name)]
+    # Final cleanup
+    cleaned: List[Restaurant] = []
+    for r in restaurants:
+        if not _looks_like_restaurant_name(r.name):
+            continue
+        # If the fallback generated a name, enforce Title Case to avoid fragments
+        if (r.why_hot is None or len((r.why_hot or "").split()) < 12) and not _is_title_case(r.name):
+            continue
+        cleaned.append(r)
+
+    return cleaned
 
 
 def extract_eater_heatmap(html: str) -> List[Restaurant]:
@@ -430,7 +510,6 @@ def extract_eater_heatmap(html: str) -> List[Restaurant]:
         nodes = _entry_slice_nodes_from_list(headings, i)
 
         why = _first_paragraph_from_slice(nodes)
-        # Stricter scan + stop boundaries to avoid "See more" image bleed
         image_url = _pick_image_from_slice(nodes, base_url=base_url, restaurant_name=name, max_tags_to_scan=40, stop_on_modules=True)
         url = _pick_link_from_slice(nodes, base_url=base_url, base_domain=base_domain)
 
@@ -662,15 +741,7 @@ def main() -> None:
     for r in merged:
         r.sources = sorted(list(set(r.sources or [])))
 
-    if not merged:
-        merged = [
-            Restaurant(
-                name="(Extraction produced 0 restaurants)",
-                why_hot="Source page structure likely changed or blocked requests. Check Actions logs for 'extracted X items'.",
-                sources=["System"],
-            )
-        ]
-
+    # Fill missing images from OG where appropriate
     for r in merged:
         if not r.image_url and r.url and _ok_for_og(r.url):
             r.image_url = og_image(r.url)
