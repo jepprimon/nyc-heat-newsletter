@@ -55,7 +55,7 @@ def _abs_url(base: str, href: Optional[str]) -> Optional[str]:
 
 def fetch_html(url: str, timeout: int = 45, retries: int = 4) -> str:
     headers = {
-        "User-Agent": "nyc-heat-index-bot/1.6 (+https://github.com/)",
+        "User-Agent": "nyc-heat-index-bot/1.7 (+https://github.com/)",
         "Accept-Language": "en-US,en;q=0.9",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Connection": "close",
@@ -95,7 +95,6 @@ def _img_src_from_tag(img) -> Optional[str]:
                 candidates.append(url)
         if candidates:
             return candidates[-1]
-
     return None
 
 
@@ -116,6 +115,7 @@ def _is_useful_outbound(href: str, base_domain: str) -> bool:
         u = urlparse(href)
         if not u.scheme.startswith("http"):
             return False
+        # exclude same-domain navigation
         if u.netloc.endswith(base_domain):
             return False
         return True
@@ -124,14 +124,10 @@ def _is_useful_outbound(href: str, base_domain: str) -> bool:
 
 
 # ---------------------------
-# Robust entry slicing (between headings in document order)
+# Robust entry slicing: between headings in document order
 # ---------------------------
 
 def _collect_between(start: Tag, end: Optional[Tag]) -> List[Tag]:
-    """
-    Collect Tag nodes in document order after `start` up to (but not including) `end`.
-    Works even when the next heading isn't a sibling.
-    """
     nodes: List[Tag] = []
     for el in start.next_elements:
         if el is end:
@@ -180,9 +176,6 @@ def _pick_link_from_slice(nodes: List[Tag], base_url: str, base_domain: str) -> 
 
 
 def _pick_image_from_slice(nodes: List[Tag], base_url: str, restaurant_name: str) -> Optional[str]:
-    """
-    Choose best image inside the entry slice only (prevents mismatched images).
-    """
     name_norm = _norm_name(restaurant_name)
     candidates: List[Tuple[int, str]] = []
 
@@ -221,7 +214,6 @@ def _pick_image_from_slice(nodes: List[Tag], base_url: str, restaurant_name: str
 
     if not candidates:
         return None
-
     candidates.sort(key=lambda x: x[0], reverse=True)
     return candidates[0][1]
 
@@ -244,12 +236,84 @@ def og_image(url: str) -> Optional[str]:
 
 def _ok_for_og(url: str) -> bool:
     u = (url or "").lower()
-    # avoid generic OG images from source/listing pages
+    # Avoid generic OG images from list pages
     if "eater.com" in u:
         return False
     if "blog.resy.com" in u:
         return False
     return True
+
+
+# ---------------------------
+# Fallback extraction (prevents "blank newsletter")
+# ---------------------------
+
+_BAD_NAME_FRAGMENTS = [
+    "newest restaurant openings",
+    "now on resy",
+    "newsletter",
+    "sign up",
+    "subscribe",
+    "follow us",
+    "gift card",
+    "resy events",
+    "private dining",
+    "more from resy",
+    "read more",
+    "updated",
+    "where to eat",
+    "the hit list",
+    "the heatmap",
+]
+
+
+def _looks_like_restaurant_name(name: str) -> bool:
+    if not name:
+        return False
+    n = name.strip()
+    if len(n) < 2 or len(n) > 80:
+        return False
+    low = n.lower()
+    if any(bad in low for bad in _BAD_NAME_FRAGMENTS):
+        return False
+    # avoid pure dates / pure numbers
+    if re.fullmatch(r"[0-9\s\-/,:.]+", n):
+        return False
+    return True
+
+
+def _fallback_from_outbound_links(html: str, base_url: str, source_label: str) -> List[Restaurant]:
+    """
+    Last-resort: pull candidate restaurant names from outbound booking/restaurant links.
+    This is intentionally permissive to avoid an empty issue.
+    """
+    soup = BeautifulSoup(html, "lxml")
+    out: List[Restaurant] = []
+    seen: set[str] = set()
+
+    for a in soup.find_all("a", href=True):
+        href = _abs_url(base_url, a.get("href"))
+        if not href or not href.startswith("http"):
+            continue
+        hlow = href.lower()
+
+        if not (("resy.com" in hlow) or ("opentable.com" in hlow)):
+            continue
+        if "blog.resy.com" in hlow:
+            continue
+
+        text = a.get_text(" ", strip=True)
+        if not _looks_like_restaurant_name(text):
+            continue
+
+        key = _norm_name(text)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        out.append(Restaurant(name=text.strip(), url=href, sources=[source_label]))
+
+    return out
 
 
 # ---------------------------
@@ -266,36 +330,15 @@ def extract_resy_hit_list(html: str) -> List[Restaurant]:
     restaurants: List[Restaurant] = []
     headings = article.find_all(["h2", "h3"])
 
+    # Primary: heading-based
     for i, h in enumerate(headings):
         text = h.get_text(" ", strip=True)
-        if not text:
+        if not _looks_like_restaurant_name(text):
             continue
 
-        if len(text) > 90:
-            continue
-
-        low = text.lower()
-        if any(k in low for k in ["hit list", "where to eat", "updated", "read more", "the hit list"]):
-            continue
-
-        # promo / utility headings
-        if any(phrase in low for phrase in [
-            "newest restaurant openings",
-            "openings, now on resy",
-            "now on resy",
-            "newsletter",
-            "sign up",
-            "subscribe",
-            "follow us",
-            "gift card",
-            "resy events",
-            "private dining",
-            "more from resy",
-        ]):
-            continue
-
+        # Resy headings sometimes include "1. Name"
         name = re.sub(r"^\s*\d+\.\s*", "", text).strip()
-        if len(name) < 2:
+        if not _looks_like_restaurant_name(name):
             continue
 
         nodes = _entry_slice_nodes_from_list(headings, i)
@@ -304,15 +347,7 @@ def extract_resy_hit_list(html: str) -> List[Restaurant]:
         image_url = _pick_image_from_slice(nodes, base_url=base_url, restaurant_name=name)
         url = _pick_link_from_slice(nodes, base_url=base_url, base_domain=base_domain)
 
-        # Entry gate: require at least a blurb OR a useful link
-        # (images can be missing in static HTML)
-        if not (why or url):
-            continue
-
-        if not url:
-            a = h.find("a", href=True)
-            url = _abs_url(base_url, a["href"]) if a else None
-
+        # IMPORTANT: do NOT over-gate here; DOM changes should not blank the whole issue.
         restaurants.append(
             Restaurant(
                 name=name,
@@ -323,7 +358,20 @@ def extract_resy_hit_list(html: str) -> List[Restaurant]:
             )
         )
 
-    return dedupe(restaurants)
+    restaurants = dedupe(restaurants)
+
+    # If we got suspiciously few, fallback from outbound booking links
+    if len(restaurants) < 5:
+        fb = _fallback_from_outbound_links(html, base_url=base_url, source_label="Resy")
+        restaurants = dedupe(restaurants + fb)
+
+    # Final cleanup: remove obvious promo header that slipped through
+    cleaned: List[Restaurant] = []
+    for r in restaurants:
+        if _looks_like_restaurant_name(r.name):
+            cleaned.append(r)
+
+    return cleaned
 
 
 def extract_eater_heatmap(html: str) -> List[Restaurant]:
@@ -336,18 +384,16 @@ def extract_eater_heatmap(html: str) -> List[Restaurant]:
     restaurants: List[Restaurant] = []
     headings = article.find_all(["h2", "h3"])
 
+    # Primary: heading-based (allow single-word names like "Tera")
     for i, h in enumerate(headings):
         title = h.get_text(" ", strip=True)
-        if not title:
+        if not _looks_like_restaurant_name(title):
             continue
 
         low = title.lower()
-
-        if len(title) > 110:
+        # Keep minimal non-entry filters (avoid nuking everything)
+        if any(k in low for k in ["related", "updates"]):
             continue
-        if any(k in low for k in ["the heatmap", "where to eat", "related", "updates"]):
-            continue
-
         if low in ("see more", "more maps in eater ny") or low.startswith("more maps"):
             continue
 
@@ -372,7 +418,14 @@ def extract_eater_heatmap(html: str) -> List[Restaurant]:
             )
         )
 
-    return dedupe(restaurants)
+    restaurants = dedupe(restaurants)
+
+    # If suspiciously few, fallback: booking links are rarer on Eater, but try anyway
+    if len(restaurants) < 5:
+        fb = _fallback_from_outbound_links(html, base_url=base_url, source_label="Eater")
+        restaurants = dedupe(restaurants + fb)
+
+    return restaurants
 
 
 # ---------------------------
@@ -518,7 +571,6 @@ def render_newsletter(output_dir: str, restaurants: List[Restaurant]) -> Tuple[s
 
 def send_email(subject: str, html_body: str) -> None:
     dry_run = (os.environ.get("DRY_RUN") or "").lower() in ("1", "true", "yes")
-
     if dry_run:
         print("DRY_RUN enabled: skipping SMTP send.")
         return
@@ -582,6 +634,19 @@ def main() -> None:
     for r in merged:
         r.sources = sorted(list(set(r.sources or [])))
 
+    # If STILL empty, add a diagnostic card so you never get a blank issue
+    if not merged:
+        merged = [
+            Restaurant(
+                name="(Extraction produced 0 restaurants)",
+                url=None,
+                image_url=None,
+                why_hot="This usually means the source pages changed structure or blocked requests. Check the Actions logs for the 'extracted X items' lines.",
+                sources=["System"],
+            )
+        ]
+
+    # Fill missing images (only when URL isn't a list page)
     for r in merged:
         if not r.image_url and r.url and _ok_for_og(r.url):
             r.image_url = og_image(r.url)
@@ -600,6 +665,7 @@ def main() -> None:
 
     print("Generated:", out_path)
     print("Title:", title)
+    print("Total cards:", len(merged))
     print("Images:", sum(1 for r in merged if r.image_url), "of", len(merged))
 
 
